@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.4.0';
+const BRAIN_VERSION = '0.4.1';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -232,14 +232,18 @@ class Plugin extends AppPlugin {
       views: () => [...this._views].map((v) => ({ focus: v.focusGuid, nodes: v.graph.nodes.length, edges: v.graph.edges.length })),
       open: async (guid) => { await this._open(guid); for (let i = 0; i < 40; i++) { await sleep(150); const v = [...this._views].pop(); if (v && v.graph.nodes.length) return { focus: v.focusGuid, nodes: v.graph.nodes.length, edges: v.graph.edges.length, focusTitle: v.graph.nodes[0] && v.graph.nodes[0].title, sampleNeighbours: v.graph.nodes.slice(1, 4).map((n) => ({ title: n.title, dir: n.dir })) }; } const v = [...this._views].pop(); return { focus: v ? v.focusGuid : null, nodes: v ? v.graph.nodes.length : -1 }; },
       derive: async (guid) => { const g = await deriveNeighbourhood(this, guid); return { focus: g.focus, neighbourCount: g.neighbours.length, dirs: g.neighbours.reduce((a, n) => { a[n.dir] = (a[n.dir] || 0) + 1; return a; }, {}) }; },
-      // Phase 4 navigation: focus A, refocus to a neighbour B, then _back -> should land on A again.
+      // Phase 4 navigation: focus A, refocus to B, _back -> A, _fwd -> B. Reuses an existing view +
+      // resets history (robust to panel saturation; doesn't depend on opening a fresh panel).
       navTest: async (a, b) => {
-        await this._open(a); let v = null; for (let i = 0; i < 40; i++) { await sleep(150); v = [...this._views].pop(); if (v && v.graph.nodes.length) break; }
+        let v = [...this._views].pop();
+        if (!v) { await this._open(a); for (let i = 0; i < 40; i++) { await sleep(150); v = [...this._views].pop(); if (v) break; } }
         if (!v) return { error: 'no view' };
-        await v.setFocus(b); const afterB = v.focusGuid; const depth = v._history.length;
+        v._history = []; v._hi = -1;
+        await v.setFocus(a); await v.setFocus(b);
+        const afterB = v.focusGuid, depth = v._history.length;
         v._back(); await sleep(500); const afterBack = v.focusGuid;
         v._fwd(); await sleep(500); const afterFwd = v.focusGuid;
-        return { afterB, afterBack, afterFwd, histDepth: depth, ok: afterB === b && afterBack === a && afterFwd === b };
+        return { afterB, afterBack, afterFwd, histDepth: depth, ok: afterB === b && afterBack === a && afterFwd === b && depth === 2 };
       },
     };
   }
