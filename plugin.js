@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.5.0';
+const BRAIN_VERSION = '0.5.1';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -52,7 +52,15 @@ async function deriveNeighbourhood(plugin, guid) {
   // outbound — ref segments + hashtag co-occurrence (records sharing a hashtag with the focus)
   let items = null; try { items = await rec.getLineItems(); } catch (_e) {}
   for (const g of refGuidsFromLineItems(items)) await addOut(g, 'ref');
-  try { for (const tag of hashtagsFromLineItems(items).slice(0, 4)) { try { const res = await plugin.data.searchByQuery('#' + tag, 8); for (const r of ((res && res.records) || [])) await addOut(r.guid, 'tag'); } catch (_e) {} } } catch (_e) {}
+  try {
+    for (const tag of hashtagsFromLineItems(items).slice(0, 4)) {
+      try {
+        const res = await plugin.data.searchByQuery('#' + tag, 8);
+        for (const r of ((res && res.records) || [])) await addOut(r.guid, 'tag');
+        for (const li of ((res && res.lines) || [])) { let g = null; try { g = li.getRecord && li.getRecord().guid; } catch (_e) {} if (g) await addOut(g, 'tag'); } // tags usually live on LINE items, resolve to their record
+      } catch (_e) {}
+    }
+  } catch (_e) {}
   // outbound — record-type PROPERTY relations (read raw via PluginProperty.values() + normalize, GUARDRAIL rule 13)
   try {
     const props = (rec.getAllProperties && rec.getAllProperties()) || [];
