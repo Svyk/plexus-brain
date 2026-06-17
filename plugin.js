@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.2.0';
+const BRAIN_VERSION = '0.3.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -102,9 +102,13 @@ class BrainView {
   }
   async setFocus(guid) {
     this.focusGuid = guid;
+    const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
     const graph = await deriveNeighbourhood(this.plugin, guid);
     if (this.destroyed) return;
-    this.graph = layoutPlex(graph); this._fit(); this.dirty = true;
+    this.graph = layoutPlex(graph);
+    for (const n of this.graph.nodes) { const p = prev.get(n.guid); n._fx = p ? p.x : 0; n._fy = p ? p.y : 0; } // FLIP: persisting nodes glide, new ones grow from centre
+    this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
+    this._fit(); this.dirty = true;
     if (this.emptyEl) this.emptyEl.style.display = this.graph.nodes.length ? 'none' : 'flex';
   }
   _fit() {
@@ -144,20 +148,25 @@ class BrainView {
     if (this.destroyed || !this.cv) return; const z = this.camera.zoom, d = this.dpr, ctx = this.cv.getContext('2d');
     ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = '#0f1117'; ctx.fillRect(0, 0, this.cv.width, this.cv.height);
     ctx.setTransform(z * d, 0, 0, z * d, -this.camera.x * z * d, -this.camera.y * z * d);
+    // FLIP tween progress (easeCubicInOut); keep ticking while animating.
+    let e = 1;
+    if (this._anim) { const now = (window.performance && performance.now ? performance.now() : Date.now()); let t = (now - this._anim.start) / this._anim.dur; if (t >= 1) { t = 1; this._anim = null; } else this.dirty = true; e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; }
+    const pos = (nd) => ({ x: nd._fx == null ? nd.x : nd._fx + (nd.x - nd._fx) * e, y: nd._fy == null ? nd.y : nd._fy + (nd.y - nd._fy) * e });
     // edges
     for (const ed of this.graph.edges) {
-      ctx.strokeStyle = ed.dir === 'in' ? '#3b82f6' : '#7c5cff'; ctx.globalAlpha = 0.55; ctx.lineWidth = 1.5 / z;
-      ctx.beginPath(); ctx.moveTo(ed.from.x, ed.from.y); const mx = (ed.from.x + ed.to.x) / 2, my = (ed.from.y + ed.to.y) / 2; ctx.quadraticCurveTo(mx, my, ed.to.x, ed.to.y); ctx.stroke();
+      const f = pos(ed.from), tn = pos(ed.to);
+      ctx.strokeStyle = ed.dir === 'in' ? '#3b82f6' : '#7c5cff'; ctx.globalAlpha = 0.55 * e; ctx.lineWidth = 1.5 / z;
+      ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.quadraticCurveTo((f.x + tn.x) / 2, (f.y + tn.y) / 2, tn.x, tn.y); ctx.stroke();
     }
     ctx.globalAlpha = 1;
     // nodes
     for (const nd of this.graph.nodes) {
-      const x = nd.x - nd.w / 2, y = nd.y - nd.h / 2; const rad = 9;
+      const P = pos(nd); const x = P.x - nd.w / 2, y = P.y - nd.h / 2; const rad = 9;
       ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, nd.w, nd.h, rad); else ctx.rect(x, y, nd.w, nd.h);
       ctx.fillStyle = nd.focus ? '#7c5cff' : '#1b2030'; ctx.fill();
       ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = nd.focus ? '#a78bfa' : (nd.dir === 'in' ? '#3b82f6' : '#7c5cff'); ctx.stroke();
       ctx.fillStyle = nd.focus ? '#ffffff' : '#e6e8ee'; ctx.font = (nd.focus ? '600 15px' : '13px') + ' system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
-      ctx.fillText(this._clip(ctx, nd.title, nd.w - 18), nd.x, nd.y);
+      ctx.fillText(this._clip(ctx, nd.title, nd.w - 18), P.x, P.y);
     }
     ctx.textAlign = 'left';
   }
