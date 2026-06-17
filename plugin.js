@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.4.1';
+const BRAIN_VERSION = '0.5.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -28,6 +28,14 @@ function refGuidsFromLineItems(items) {
   }
   return out;
 }
+function hashtagsFromLineItems(items) {
+  const out = new Set();
+  for (const li of (items || [])) {
+    let segs = null; try { segs = li.segments || []; } catch (_e) { segs = []; }
+    for (const s of segs) { if (s && s.type === 'hashtag') { const t = (typeof s.text === 'string') ? s.text : (s.text && (s.text.label || s.text.tag)) || ''; if (t) out.add(String(t).replace(/^#/, '')); } }
+  }
+  return [...out];
+}
 // Returns { focus:{guid,title}, neighbours:[{guid,title,dir}] }  dir: 'in'|'out'
 async function deriveNeighbourhood(plugin, guid) {
   const rec = await plugin.data.getRecord(guid);
@@ -41,8 +49,10 @@ async function deriveNeighbourhood(plugin, guid) {
     let title = 'Untitled'; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || title; else return; } catch (_e) { return; }
     neighbours.push({ guid: g, title, dir: 'out', kind: kind || 'ref' });
   };
-  // outbound — ref segments inside the focus's line items
-  try { const items = await rec.getLineItems(); for (const g of refGuidsFromLineItems(items)) await addOut(g, 'ref'); } catch (_e) {}
+  // outbound — ref segments + hashtag co-occurrence (records sharing a hashtag with the focus)
+  let items = null; try { items = await rec.getLineItems(); } catch (_e) {}
+  for (const g of refGuidsFromLineItems(items)) await addOut(g, 'ref');
+  try { for (const tag of hashtagsFromLineItems(items).slice(0, 4)) { try { const res = await plugin.data.searchByQuery('#' + tag, 8); for (const r of ((res && res.records) || [])) await addOut(r.guid, 'tag'); } catch (_e) {} } } catch (_e) {}
   // outbound — record-type PROPERTY relations (read raw via PluginProperty.values() + normalize, GUARDRAIL rule 13)
   try {
     const props = (rec.getAllProperties && rec.getAllProperties()) || [];
@@ -57,6 +67,8 @@ async function deriveNeighbourhood(plugin, guid) {
   return { focus, neighbours };
 }
 // Radial layout: focus at (0,0), neighbours on rings around it.
+// Per-relation colour: incoming=blue, ref=purple, property=green, hashtag=amber.
+function relColor(dir, kind) { if (dir === 'in') return '#3b82f6'; if (kind === 'prop') return '#10b981'; if (kind === 'tag') return '#f59e0b'; return '#7c5cff'; }
 function layoutPlex(graph) {
   const nodes = []; const NW = 168, NH = 44;
   nodes.push({ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true });
@@ -65,10 +77,10 @@ function layoutPlex(graph) {
   for (const nb of graph.neighbours) {
     const ring = Math.floor(i / perRing), idxInRing = i % perRing, countInRing = Math.min(perRing, n - ring * perRing);
     const R = R0 + ring * 200, a = (idxInRing / countInRing) * Math.PI * 2 - Math.PI / 2;
-    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir });
+    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind });
     i++;
   }
-  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir }));
+  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind }));
   return { nodes, edges };
 }
 
@@ -180,7 +192,7 @@ class BrainView {
     // edges
     for (const ed of this.graph.edges) {
       const f = pos(ed.from), tn = pos(ed.to);
-      ctx.strokeStyle = ed.dir === 'in' ? '#3b82f6' : '#7c5cff'; ctx.globalAlpha = 0.55 * e; ctx.lineWidth = 1.5 / z;
+      ctx.strokeStyle = relColor(ed.dir, ed.kind); ctx.globalAlpha = 0.55 * e; ctx.lineWidth = 1.5 / z;
       ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.quadraticCurveTo((f.x + tn.x) / 2, (f.y + tn.y) / 2, tn.x, tn.y); ctx.stroke();
     }
     ctx.globalAlpha = 1;
@@ -189,7 +201,7 @@ class BrainView {
       const P = pos(nd); const x = P.x - nd.w / 2, y = P.y - nd.h / 2; const rad = 9;
       ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, nd.w, nd.h, rad); else ctx.rect(x, y, nd.w, nd.h);
       ctx.fillStyle = nd.focus ? '#7c5cff' : '#1b2030'; ctx.fill();
-      ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = nd.focus ? '#a78bfa' : (nd.dir === 'in' ? '#3b82f6' : '#7c5cff'); ctx.stroke();
+      ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = nd.focus ? '#a78bfa' : relColor(nd.dir, nd.kind); ctx.stroke();
       ctx.fillStyle = nd.focus ? '#ffffff' : '#e6e8ee'; ctx.font = (nd.focus ? '600 15px' : '13px') + ' system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
       ctx.fillText(this._clip(ctx, nd.title, nd.w - 18), P.x, P.y);
     }
