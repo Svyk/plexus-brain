@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.3.0';
+const BRAIN_VERSION = '0.4.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -79,11 +79,13 @@ class BrainView {
     this.focusGuid = focusGuid; this.camera = new Camera(-400, -300, 1);
     this.dpr = Math.max(1, window.devicePixelRatio || 1); this.dirty = true; this.destroyed = false;
     this.graph = { nodes: [], edges: [] }; this._disposers = []; this._hover = null;
+    this._history = []; this._hi = -1; // Phase 4 navigation history
   }
   mount() {
     try { this.panel.setTitle('Brain'); } catch (_e) {}
     const host = this.host; host.innerHTML = ''; host.classList.add('pb-host');
     const wrap = document.createElement('div'); wrap.className = 'pb-root'; this.wrap = wrap;
+    wrap.appendChild(this._buildChrome());
     this.cv = document.createElement('canvas'); this.cv.className = 'pb-canvas'; this.cv.tabIndex = 0;
     wrap.appendChild(this.cv);
     const hint = document.createElement('div'); hint.className = 'pb-hint'; hint.textContent = 'click a node to refocus · ⇧/⌘-click opens the record · drag = pan · scroll = zoom'; wrap.appendChild(hint);
@@ -97,20 +99,43 @@ class BrainView {
     const sc = this.host.closest('.panel-scroller-y') || this.host.closest('.panel') || this.host.parentElement;
     let h = sc ? sc.clientHeight : 0; if (!h || h < 80) h = Math.max(320, (window.innerHeight || 800) - 120);
     this.wrap.style.height = h + 'px'; const w = this.wrap.clientWidth || this.host.clientWidth || 600;
-    this.cv.width = Math.round(w * this.dpr); this.cv.height = Math.round(h * this.dpr); this.cv.style.width = w + 'px'; this.cv.style.height = h + 'px';
-    this.cssW = w; this.cssH = h;
+    const ch = this._chromeEl ? this._chromeEl.offsetHeight : 0; const cvh = Math.max(80, h - ch);
+    this.cv.width = Math.round(w * this.dpr); this.cv.height = Math.round(cvh * this.dpr); this.cv.style.width = w + 'px'; this.cv.style.height = cvh + 'px';
+    this.cssW = w; this.cssH = cvh;
   }
-  async setFocus(guid) {
+  async setFocus(guid, nav) {
     this.focusGuid = guid;
+    if (!nav) { this._history = this._history.slice(0, this._hi + 1); if (this._history[this._hi] !== guid) { this._history.push(guid); this._hi = this._history.length - 1; } }
     const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
     const graph = await deriveNeighbourhood(this.plugin, guid);
     if (this.destroyed) return;
     this.graph = layoutPlex(graph);
     for (const n of this.graph.nodes) { const p = prev.get(n.guid); n._fx = p ? p.x : 0; n._fy = p ? p.y : 0; } // FLIP: persisting nodes glide, new ones grow from centre
     this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
-    this._fit(); this.dirty = true;
+    this._fit(); this.dirty = true; this._updateChrome();
     if (this.emptyEl) this.emptyEl.style.display = this.graph.nodes.length ? 'none' : 'flex';
   }
+  _buildChrome() {
+    const bar = document.createElement('div'); bar.className = 'pb-chrome'; this._chromeEl = bar;
+    bar.addEventListener('pointerdown', (e) => e.stopPropagation()); bar.addEventListener('wheel', (e) => e.stopPropagation());
+    const mkBtn = (txt, fn) => { const b = document.createElement('button'); b.className = 'pb-btn'; b.textContent = txt; b.addEventListener('click', fn); return b; };
+    this._backBtn = mkBtn('‹', () => this._back()); this._fwdBtn = mkBtn('›', () => this._fwd());
+    bar.appendChild(this._backBtn); bar.appendChild(this._fwdBtn);
+    this._crumbEl = document.createElement('span'); this._crumbEl.className = 'pb-crumb'; bar.appendChild(this._crumbEl);
+    const sp = document.createElement('span'); sp.style.flex = '1'; bar.appendChild(sp);
+    this._searchInp = document.createElement('input'); this._searchInp.className = 'pb-search'; this._searchInp.placeholder = 'Search a record…';
+    this._searchInp.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') this._searchFocus(this._searchInp.value); });
+    bar.appendChild(this._searchInp);
+    return bar;
+  }
+  _updateChrome() {
+    if (this._backBtn) this._backBtn.disabled = this._hi <= 0;
+    if (this._fwdBtn) this._fwdBtn.disabled = this._hi >= this._history.length - 1;
+    if (this._crumbEl) { const t = (this.graph.nodes[0] && this.graph.nodes[0].title) || ''; this._crumbEl.textContent = t + (this._history.length > 1 ? '  ·  ' + (this._hi + 1) + '/' + this._history.length : ''); }
+  }
+  _back() { if (this._hi > 0) { this._hi--; this.setFocus(this._history[this._hi], true); } }
+  _fwd() { if (this._hi < this._history.length - 1) { this._hi++; this.setFocus(this._history[this._hi], true); } }
+  async _searchFocus(q) { q = (q || '').trim(); if (!q) return; try { const res = await this.plugin.data.searchByQuery(q, 5); const r = (res && res.records && res.records[0]); if (r && r.guid) { this.setFocus(r.guid); this._searchInp.value = ''; } else { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: no record matched "' + q + '".', dismissible: true }); } catch (_e) {} } } catch (_e) {} }
   _fit() {
     const nodes = this.graph.nodes; if (!nodes.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -207,6 +232,15 @@ class Plugin extends AppPlugin {
       views: () => [...this._views].map((v) => ({ focus: v.focusGuid, nodes: v.graph.nodes.length, edges: v.graph.edges.length })),
       open: async (guid) => { await this._open(guid); for (let i = 0; i < 40; i++) { await sleep(150); const v = [...this._views].pop(); if (v && v.graph.nodes.length) return { focus: v.focusGuid, nodes: v.graph.nodes.length, edges: v.graph.edges.length, focusTitle: v.graph.nodes[0] && v.graph.nodes[0].title, sampleNeighbours: v.graph.nodes.slice(1, 4).map((n) => ({ title: n.title, dir: n.dir })) }; } const v = [...this._views].pop(); return { focus: v ? v.focusGuid : null, nodes: v ? v.graph.nodes.length : -1 }; },
       derive: async (guid) => { const g = await deriveNeighbourhood(this, guid); return { focus: g.focus, neighbourCount: g.neighbours.length, dirs: g.neighbours.reduce((a, n) => { a[n.dir] = (a[n.dir] || 0) + 1; return a; }, {}) }; },
+      // Phase 4 navigation: focus A, refocus to a neighbour B, then _back -> should land on A again.
+      navTest: async (a, b) => {
+        await this._open(a); let v = null; for (let i = 0; i < 40; i++) { await sleep(150); v = [...this._views].pop(); if (v && v.graph.nodes.length) break; }
+        if (!v) return { error: 'no view' };
+        await v.setFocus(b); const afterB = v.focusGuid; const depth = v._history.length;
+        v._back(); await sleep(500); const afterBack = v.focusGuid;
+        v._fwd(); await sleep(500); const afterFwd = v.focusGuid;
+        return { afterB, afterBack, afterFwd, histDepth: depth, ok: afterB === b && afterBack === a && afterFwd === b };
+      },
     };
   }
 }
@@ -217,4 +251,10 @@ const BASE_CSS = `
 .pb-host .pb-root .pb-canvas { display: block; touch-action: none; cursor: grab; outline: none; }
 .pb-host .pb-root .pb-hint { position: absolute; left: 12px; bottom: 10px; font-size: 11px; color: #6b7280; pointer-events: none; }
 .pb-host .pb-root .pb-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #9aa0a6; font-size: 14px; text-align: center; pointer-events: none; }
+.pb-host .pb-root .pb-chrome { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: #151823; border-bottom: 1px solid #232838; }
+.pb-host .pb-root .pb-btn { width: 26px; height: 26px; border: 1px solid #2a3142; border-radius: 6px; background: #1b2030; color: #cbd1de; cursor: pointer; font-size: 15px; line-height: 1; padding: 0; }
+.pb-host .pb-root .pb-btn:hover:not(:disabled) { background: #232b3d; }
+.pb-host .pb-root .pb-btn:disabled { opacity: .35; cursor: default; }
+.pb-host .pb-root .pb-crumb { font-size: 12px; color: #9aa0a6; margin-left: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+.pb-host .pb-root .pb-search { width: 180px; padding: 5px 9px; border: 1px solid #2a3142; border-radius: 6px; background: #0f1117; color: #e6e8ee; font-size: 13px; outline: none; }
 `;
