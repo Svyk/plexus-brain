@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.1.0';
+const BRAIN_VERSION = '0.2.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -36,13 +36,22 @@ async function deriveNeighbourhood(plugin, guid) {
   const seen = new Set([guid]); const neighbours = [];
   // incoming — records that link to the focus
   try { const back = await rec.getBackReferenceRecords(); for (const r of (back || [])) { const g = r.guid; if (g && !seen.has(g)) { seen.add(g); neighbours.push({ guid: g, title: (r.getName && r.getName()) || 'Untitled', dir: 'in' }); } } } catch (_e) {}
+  const addOut = async (g, kind) => {
+    if (!g || seen.has(g)) return; seen.add(g);
+    let title = 'Untitled'; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || title; else return; } catch (_e) { return; }
+    neighbours.push({ guid: g, title, dir: 'out', kind: kind || 'ref' });
+  };
   // outbound — ref segments inside the focus's line items
+  try { const items = await rec.getLineItems(); for (const g of refGuidsFromLineItems(items)) await addOut(g, 'ref'); } catch (_e) {}
+  // outbound — record-type PROPERTY relations (read raw via PluginProperty.values() + normalize, GUARDRAIL rule 13)
   try {
-    const items = await rec.getLineItems(); const guids = refGuidsFromLineItems(items);
-    for (const g of guids) {
-      if (!g || seen.has(g)) continue; seen.add(g);
-      let title = 'Untitled'; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || title; else continue; } catch (_e) { continue; }
-      neighbours.push({ guid: g, title, dir: 'out' });
+    const props = (rec.getAllProperties && rec.getAllProperties()) || [];
+    for (const pr of props) {
+      let raw = null; try { raw = pr.values && pr.values(); } catch (_e) {}
+      for (const v of (raw || [])) {
+        if (typeof v === 'string') { if (v[0] === '[') { try { for (const g of JSON.parse(v)) if (typeof g === 'string') await addOut(g, 'prop'); } catch (_e) {} } else if (/^[0-9A-Z]{12,}$/.test(v)) await addOut(v, 'prop'); }
+        else if (v && typeof v === 'object' && v.guid) await addOut(v.guid, 'prop');
+      }
     }
   } catch (_e) {}
   return { focus, neighbours };
