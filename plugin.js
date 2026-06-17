@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.8.0';
+const BRAIN_VERSION = '0.9.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -99,6 +99,22 @@ function layoutTree(graph) {
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind }));
   return { nodes, edges };
 }
+// P8: structured cross layout — parents (backrefs) above, children (refs/props) below, friends (tag/sem) to the
+// sides. Roles come from dir/kind, mapped to Thymer's typed channels (ExcaliBrain parity).
+function layoutCross(graph) {
+  const NW = 172, NH = 44;
+  const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
+  const role = (nb) => nb.dir === 'in' ? 'up' : (nb.kind === 'tag' ? 'right' : (nb.kind === 'sem' ? 'left' : 'down'));
+  const b = { up: [], down: [], left: [], right: [] };
+  for (const nb of graph.neighbours) b[role(nb)].push(nb);
+  const HSTEP = NW + 26, VSTEP = NH + 18, COLS = 6;
+  const row = (arr, ySign) => arr.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, arr.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind }); });
+  const col = (arr, xSign) => arr.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (arr.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind }));
+  row(b.up, -1); row(b.down, 1); col(b.left, -1); col(b.right, 1);
+  const m = {}; nodes.forEach((nd) => { m[nd.guid] = nd; });
+  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind })).filter((e) => e.to);
+  return { nodes, edges };
+}
 
 /* ───────── view ───────── */
 class BrainView {
@@ -146,7 +162,7 @@ class BrainView {
     const f = this._filter || { in: true, ref: true, prop: true, tag: true };
     const kept = this._derived.neighbours.filter((n) => f[n.dir === 'in' ? 'in' : (n.kind || 'ref')] !== false);
     const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
-    const lay = this._layoutMode === 'tree' ? layoutTree : layoutPlex;
+    const lay = this._layoutMode === 'tree' ? layoutTree : (this._layoutMode === 'cross' ? layoutCross : layoutPlex);
     this.graph = lay({ focus: this._derived.focus, neighbours: kept });
     for (const n of this.graph.nodes) { const p = prev.get(n.guid); n._fx = p ? p.x : 0; n._fy = p ? p.y : 0; }
     this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
@@ -181,8 +197,9 @@ class BrainView {
     const mkBtn = (txt, fn) => { const b = document.createElement('button'); b.className = 'pb-btn'; b.textContent = txt; b.addEventListener('click', fn); return b; };
     this._backBtn = mkBtn('‹', () => this._back()); this._fwdBtn = mkBtn('›', () => this._fwd());
     bar.appendChild(this._backBtn); bar.appendChild(this._fwdBtn);
-    this._layoutBtn = mkBtn('⊞', () => { this._layoutMode = this._layoutMode === 'tree' ? 'radial' : 'tree'; this._layoutBtn.textContent = this._layoutMode === 'tree' ? '◎' : '⊞'; this._layoutBtn.title = this._layoutMode === 'tree' ? 'Tree layout (click for radial)' : 'Radial layout (click for tree)'; this._relayout(); });
-    this._layoutBtn.title = 'Radial layout (click for tree)'; bar.appendChild(this._layoutBtn);
+    const LAYOUTS = ['radial', 'cross', 'tree'], LGLYPH = { radial: '◎', cross: '✛', tree: '⊞' };
+    this._layoutBtn = mkBtn('◎', () => { const i = (LAYOUTS.indexOf(this._layoutMode) + 1) % LAYOUTS.length; this._layoutMode = LAYOUTS[i]; this._layoutBtn.textContent = LGLYPH[this._layoutMode]; this._layoutBtn.title = this._layoutMode + ' layout (click to cycle)'; this._relayout(); }); // P8: radial → cross → tree
+    this._layoutBtn.textContent = LGLYPH[this._layoutMode] || '◎'; this._layoutBtn.title = (this._layoutMode || 'radial') + ' layout (click to cycle)'; bar.appendChild(this._layoutBtn);
     this._crumbEl = document.createElement('span'); this._crumbEl.className = 'pb-crumb'; bar.appendChild(this._crumbEl);
     const sp = document.createElement('span'); sp.style.flex = '1'; bar.appendChild(sp);
     // Phase 5/6: relation-kind filter chips (colour-matched to relColor). 'sem' = the embedding lens (opt-in).
@@ -252,6 +269,10 @@ class BrainView {
       const f = pos(ed.from), tn = pos(ed.to);
       ctx.strokeStyle = relColor(ed.dir, ed.kind); ctx.globalAlpha = 0.55 * e; ctx.lineWidth = 1.5 / z;
       ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.quadraticCurveTo((f.x + tn.x) / 2, (f.y + tn.y) / 2, tn.x, tn.y); ctx.stroke();
+      // P8: arrowhead encodes direction — 'in' (parent) points AT the focus, others point AWAY to the neighbour.
+      const hx = ed.dir === 'in' ? f.x : tn.x, hy = ed.dir === 'in' ? f.y : tn.y, ox = ed.dir === 'in' ? tn.x : f.x, oy = ed.dir === 'in' ? tn.y : f.y;
+      const ang = Math.atan2(hy - oy, hx - ox), aw = 9 / z;
+      ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(hx - aw * Math.cos(ang - 0.4), hy - aw * Math.sin(ang - 0.4)); ctx.lineTo(hx - aw * Math.cos(ang + 0.4), hy - aw * Math.sin(ang + 0.4)); ctx.closePath(); ctx.fillStyle = relColor(ed.dir, ed.kind); ctx.fill();
     }
     ctx.globalAlpha = 1;
     // nodes
