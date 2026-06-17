@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.7.0';
+const BRAIN_VERSION = '0.8.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -76,7 +76,7 @@ async function deriveNeighbourhood(plugin, guid) {
 }
 // Radial layout: focus at (0,0), neighbours on rings around it.
 // Per-relation colour: incoming=blue, ref=purple, property=green, hashtag=amber.
-function relColor(dir, kind) { if (dir === 'in') return '#3b82f6'; if (kind === 'prop') return '#10b981'; if (kind === 'tag') return '#f59e0b'; return '#7c5cff'; }
+function relColor(dir, kind) { if (dir === 'in') return '#3b82f6'; if (kind === 'prop') return '#10b981'; if (kind === 'tag') return '#f59e0b'; if (kind === 'sem') return '#ec4899'; return '#7c5cff'; }
 function layoutPlex(graph) {
   const nodes = []; const NW = 168, NH = 44;
   nodes.push({ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true });
@@ -108,7 +108,7 @@ class BrainView {
     this.dpr = Math.max(1, window.devicePixelRatio || 1); this.dirty = true; this.destroyed = false;
     this.graph = { nodes: [], edges: [] }; this._disposers = []; this._hover = null;
     this._history = []; this._hi = -1; // Phase 4 navigation history
-    this._filter = { in: true, ref: true, prop: true, tag: true }; // Phase 5 kind filters
+    this._filter = { in: true, ref: true, prop: true, tag: true, sem: false }; // Phase 5/6 kind filters (sem opt-in)
     this._layoutMode = 'radial'; // Phase 7: 'radial' | 'tree'
   }
   mount() {
@@ -153,6 +153,28 @@ class BrainView {
     this._fit(); this.dirty = true; this._updateChrome();
     if (this.emptyEl) this.emptyEl.style.display = this.graph.nodes.length ? 'none' : 'flex';
   }
+  // Phase 6 semantic lens: embed the focus + a keyword-search candidate set, add the most-similar as 'sem'.
+  async _addSemantic() {
+    if (!this._derived) return;
+    if (this._derived._semDone) { this._relayout(); return; }
+    this._derived._semDone = true;
+    const focusTitle = this._derived.focus.title || '';
+    const words = focusTitle.split(/\s+/).filter((w) => w.length > 3).slice(0, 5).join(' ') || focusTitle;
+    try { this.plugin.ui.addToaster({ title: 'Plexus Brain: embedding for the semantic lens… (first run loads a model)', dismissible: true }); } catch (_e) {}
+    let cands = [];
+    try { const res = await this.plugin.data.searchByQuery(words, 25); cands = ((res && res.records) || []).map((r) => ({ guid: r.guid, title: (r.getName && r.getName()) || '' })); } catch (_e) {}
+    const seen = new Set([this._derived.focus.guid].concat(this._derived.neighbours.map((n) => n.guid)));
+    cands = cands.filter((c) => c.guid && c.title && !seen.has(c.guid)).slice(0, 18);
+    if (cands.length) {
+      try {
+        const fv = await this.plugin._embed(focusTitle); const sims = [];
+        for (const c of cands) { try { const cv = await this.plugin._embed(c.title); let s = 0; for (let i = 0; i < fv.length; i++) s += fv[i] * cv[i]; sims.push({ guid: c.guid, title: c.title, sim: s }); } catch (_e) {} }
+        sims.sort((a, b) => b.sim - a.sim);
+        for (const c of sims.slice(0, 6)) if (c.sim > 0.4) this._derived.neighbours.push({ guid: c.guid, title: c.title, dir: 'out', kind: 'sem' });
+      } catch (_e) {}
+    }
+    this._relayout();
+  }
   _buildChrome() {
     const bar = document.createElement('div'); bar.className = 'pb-chrome'; this._chromeEl = bar;
     bar.addEventListener('pointerdown', (e) => e.stopPropagation()); bar.addEventListener('wheel', (e) => e.stopPropagation());
@@ -163,11 +185,12 @@ class BrainView {
     this._layoutBtn.title = 'Radial layout (click for tree)'; bar.appendChild(this._layoutBtn);
     this._crumbEl = document.createElement('span'); this._crumbEl.className = 'pb-crumb'; bar.appendChild(this._crumbEl);
     const sp = document.createElement('span'); sp.style.flex = '1'; bar.appendChild(sp);
-    // Phase 5: relation-kind filter chips (colour-matched to relColor)
+    // Phase 5/6: relation-kind filter chips (colour-matched to relColor). 'sem' = the embedding lens (opt-in).
     this._filterChips = {};
-    for (const [k, label, col] of [['in', 'in', '#3b82f6'], ['ref', 'ref', '#7c5cff'], ['prop', 'prop', '#10b981'], ['tag', 'tag', '#f59e0b']]) {
+    for (const [k, label, col] of [['in', 'in', '#3b82f6'], ['ref', 'ref', '#7c5cff'], ['prop', 'prop', '#10b981'], ['tag', 'tag', '#f59e0b'], ['sem', '✦sem', '#ec4899']]) {
       const c = document.createElement('button'); c.className = 'pb-chip'; c.textContent = label; c.style.setProperty('--c', col);
-      c.addEventListener('click', () => { this._filter[k] = !this._filter[k]; c.classList.toggle('off', !this._filter[k]); this._relayout(); });
+      if (k === 'sem') c.classList.add('off');
+      c.addEventListener('click', () => { this._filter[k] = !this._filter[k]; c.classList.toggle('off', !this._filter[k]); if (k === 'sem' && this._filter.sem) this._addSemantic(); else this._relayout(); });
       bar.appendChild(c); this._filterChips[k] = c;
     }
     this._searchInp = document.createElement('input'); this._searchInp.className = 'pb-search'; this._searchInp.placeholder = 'Search a record…';
@@ -267,6 +290,13 @@ class Plugin extends AppPlugin {
   _teardown() { cancelAnimationFrame(this._raf); for (const v of this._views) { try { v.destroy(); } catch (_e) {} } this._views.clear(); window.__plexusBrain = undefined; }
   onUnload() { this._teardown(); }
   _activeRecord() { try { const p = this.ui.getActivePanel(); const r = p && p.getActiveRecord && p.getActiveRecord(); return (r && r.guid) || this._lastRecordGuid; } catch (_e) { return this._lastRecordGuid; } }
+  // Phase 6: local embedder (transformers.js, in-browser) — powers the semantic lens.
+  _getEmbedder() {
+    if (this._embedderP) return this._embedderP;
+    this._embedderP = (async () => { const t = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6'); try { t.env.allowLocalModels = false; } catch (_e) {} return await t.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2'); })();
+    return this._embedderP;
+  }
+  async _embed(text) { const pipe = await this._getEmbedder(); const out = await pipe(String(text || '').slice(0, 400), { pooling: 'mean', normalize: true }); return Array.from(out.data); }
   async _open(focusGuid) {
     const here = this.ui.getActivePanel();
     const panel = await this.ui.createPanel(here ? { afterPanel: here } : undefined);
@@ -296,6 +326,24 @@ class Plugin extends AppPlugin {
         v._layoutMode = 'tree'; v._relayout(); await sleep(400); const treeY = v.graph.nodes[1].y;
         v._layoutMode = 'radial'; v._relayout(); await sleep(400); const radialY = v.graph.nodes[1].y;
         return { treeNeighbourY: Math.round(treeY), radialNeighbourY: Math.round(radialY), ok: treeY >= 90 && treeY !== radialY };
+      },
+      // Phase 6 (view-independent): the local embedder loads + ranks similar text higher.
+      embedTest: async () => {
+        try {
+          const a = await this._embed('cat dog pet animal'), b = await this._embed('puppy kitten pets'), c = await this._embed('quarterly budget finance');
+          const cos = (x, y) => { let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; };
+          return { dim: a.length, modelLoaded: !!this._embedderP, petSim: +cos(a, b).toFixed(3), petFinSim: +cos(a, c).toFixed(3), ok: cos(a, b) > cos(a, c) };
+        } catch (e) { return { error: String(e) }; }
+      },
+      // Phase 6 semantic lens: focus a record, enable the lens, confirm 'sem' neighbours get added.
+      semLensTest: async (guid) => {
+        let v = [...this._views].pop(); if (!v) { await this._open(guid); for (let i = 0; i < 40; i++) { await sleep(150); v = [...this._views].pop(); if (v) break; } }
+        if (!v) return { error: 'no view' };
+        await v.setFocus(guid); const before = v._derived ? v._derived.neighbours.length : -1;
+        v._filter.sem = true; await v._addSemantic();
+        const after = v._derived ? v._derived.neighbours.length : -1;
+        const semN = v._derived ? v._derived.neighbours.filter((n) => n.kind === 'sem').length : -1;
+        return { before, after, semNeighbours: semN, ok: after >= before };
       },
       // Phase 4 navigation: focus A, refocus to B, _back -> A, _fwd -> B. Reuses an existing view +
       // resets history (robust to panel saturation; doesn't depend on opening a fresh panel).
