@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.5.1';
+const BRAIN_VERSION = '0.6.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -100,6 +100,7 @@ class BrainView {
     this.dpr = Math.max(1, window.devicePixelRatio || 1); this.dirty = true; this.destroyed = false;
     this.graph = { nodes: [], edges: [] }; this._disposers = []; this._hover = null;
     this._history = []; this._hi = -1; // Phase 4 navigation history
+    this._filter = { in: true, ref: true, prop: true, tag: true }; // Phase 5 kind filters
   }
   mount() {
     try { this.panel.setTitle('Brain'); } catch (_e) {}
@@ -126,11 +127,18 @@ class BrainView {
   async setFocus(guid, nav) {
     this.focusGuid = guid;
     if (!nav) { this._history = this._history.slice(0, this._hi + 1); if (this._history[this._hi] !== guid) { this._history.push(guid); this._hi = this._history.length - 1; } }
-    const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
-    const graph = await deriveNeighbourhood(this.plugin, guid);
+    this._derived = await deriveNeighbourhood(this.plugin, guid);
     if (this.destroyed) return;
-    this.graph = layoutPlex(graph);
-    for (const n of this.graph.nodes) { const p = prev.get(n.guid); n._fx = p ? p.x : 0; n._fy = p ? p.y : 0; } // FLIP: persisting nodes glide, new ones grow from centre
+    this._relayout();
+  }
+  // Phase 5: filter the derived neighbours by kind, re-layout with a FLIP tween (no re-derive).
+  _relayout() {
+    if (!this._derived) return;
+    const f = this._filter || { in: true, ref: true, prop: true, tag: true };
+    const kept = this._derived.neighbours.filter((n) => f[n.dir === 'in' ? 'in' : (n.kind || 'ref')] !== false);
+    const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
+    this.graph = layoutPlex({ focus: this._derived.focus, neighbours: kept });
+    for (const n of this.graph.nodes) { const p = prev.get(n.guid); n._fx = p ? p.x : 0; n._fy = p ? p.y : 0; }
     this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
     this._fit(); this.dirty = true; this._updateChrome();
     if (this.emptyEl) this.emptyEl.style.display = this.graph.nodes.length ? 'none' : 'flex';
@@ -143,6 +151,13 @@ class BrainView {
     bar.appendChild(this._backBtn); bar.appendChild(this._fwdBtn);
     this._crumbEl = document.createElement('span'); this._crumbEl.className = 'pb-crumb'; bar.appendChild(this._crumbEl);
     const sp = document.createElement('span'); sp.style.flex = '1'; bar.appendChild(sp);
+    // Phase 5: relation-kind filter chips (colour-matched to relColor)
+    this._filterChips = {};
+    for (const [k, label, col] of [['in', 'in', '#3b82f6'], ['ref', 'ref', '#7c5cff'], ['prop', 'prop', '#10b981'], ['tag', 'tag', '#f59e0b']]) {
+      const c = document.createElement('button'); c.className = 'pb-chip'; c.textContent = label; c.style.setProperty('--c', col);
+      c.addEventListener('click', () => { this._filter[k] = !this._filter[k]; c.classList.toggle('off', !this._filter[k]); this._relayout(); });
+      bar.appendChild(c); this._filterChips[k] = c;
+    }
     this._searchInp = document.createElement('input'); this._searchInp.className = 'pb-search'; this._searchInp.placeholder = 'Search a record…';
     this._searchInp.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') this._searchFocus(this._searchInp.value); });
     bar.appendChild(this._searchInp);
@@ -252,6 +267,15 @@ class Plugin extends AppPlugin {
       views: () => [...this._views].map((v) => ({ focus: v.focusGuid, nodes: v.graph.nodes.length, edges: v.graph.edges.length })),
       open: async (guid) => { await this._open(guid); for (let i = 0; i < 40; i++) { await sleep(150); const v = [...this._views].pop(); if (v && v.graph.nodes.length) return { focus: v.focusGuid, nodes: v.graph.nodes.length, edges: v.graph.edges.length, focusTitle: v.graph.nodes[0] && v.graph.nodes[0].title, sampleNeighbours: v.graph.nodes.slice(1, 4).map((n) => ({ title: n.title, dir: n.dir })) }; } const v = [...this._views].pop(); return { focus: v ? v.focusGuid : null, nodes: v ? v.graph.nodes.length : -1 }; },
       derive: async (guid) => { const g = await deriveNeighbourhood(this, guid); return { focus: g.focus, neighbourCount: g.neighbours.length, dirs: g.neighbours.reduce((a, n) => { a[n.dir] = (a[n.dir] || 0) + 1; return a; }, {}) }; },
+      // Phase 5 filters: focus a multi-kind record (journal: in+tag), toggle 'tag' off -> node count drops.
+      filterTest: async (guid) => {
+        let v = [...this._views].pop(); if (!v) { await this._open(guid); for (let i = 0; i < 40; i++) { await sleep(150); v = [...this._views].pop(); if (v) break; } }
+        if (!v) return { error: 'no view' };
+        v._filter = { in: true, ref: true, prop: true, tag: true }; await v.setFocus(guid); const before = v.graph.nodes.length;
+        v._filter.tag = false; v._relayout(); await sleep(450); const afterNoTag = v.graph.nodes.length;
+        v._filter.tag = true; v._relayout(); await sleep(450); const afterTag = v.graph.nodes.length;
+        return { before, afterNoTag, afterTag, ok: afterNoTag < before && afterTag === before };
+      },
       // Phase 4 navigation: focus A, refocus to B, _back -> A, _fwd -> B. Reuses an existing view +
       // resets history (robust to panel saturation; doesn't depend on opening a fresh panel).
       navTest: async (a, b) => {
@@ -281,4 +305,6 @@ const BASE_CSS = `
 .pb-host .pb-root .pb-btn:disabled { opacity: .35; cursor: default; }
 .pb-host .pb-root .pb-crumb { font-size: 12px; color: #9aa0a6; margin-left: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
 .pb-host .pb-root .pb-search { width: 180px; padding: 5px 9px; border: 1px solid #2a3142; border-radius: 6px; background: #0f1117; color: #e6e8ee; font-size: 13px; outline: none; }
+.pb-host .pb-root .pb-chip { font-size: 11px; padding: 3px 9px; border-radius: 11px; border: 1px solid var(--c); background: var(--c); color: #0f1117; font-weight: 600; cursor: pointer; }
+.pb-host .pb-root .pb-chip.off { background: transparent; color: #6b7280; opacity: .6; }
 `;
