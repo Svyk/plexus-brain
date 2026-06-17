@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.10.0';
+const BRAIN_VERSION = '0.11.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -46,7 +46,7 @@ async function deriveNeighbourhood(plugin, guid) {
   try { const back = await rec.getBackReferenceRecords(); for (const r of (back || [])) { const g = r.guid; if (g && !seen.has(g)) { seen.add(g); neighbours.push({ guid: g, title: (r.getName && r.getName()) || 'Untitled', dir: 'in' }); } } } catch (_e) {}
   const addOut = async (g, kind) => {
     if (!g || seen.has(g)) return; seen.add(g);
-    let title = 'Untitled'; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || title; else return; } catch (_e) { return; }
+    let title = 'Untitled'; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || title; else { if (kind === 'ref') neighbours.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual' }); return; } } catch (_e) { if (kind === 'ref') neighbours.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual' }); return; } // P9: virtual node for an unresolvable ref
     neighbours.push({ guid: g, title, dir: 'out', kind: kind || 'ref' });
   };
   // outbound — ref segments + hashtag co-occurrence (records sharing a hashtag with the focus)
@@ -78,7 +78,7 @@ async function deriveNeighbourhood(plugin, guid) {
 }
 // Radial layout: focus at (0,0), neighbours on rings around it.
 // Per-relation colour: incoming=blue, ref=purple, property=green, hashtag=amber.
-function relColor(dir, kind) { if (dir === 'in') return '#3b82f6'; if (kind === 'prop') return '#10b981'; if (kind === 'tag') return '#f59e0b'; if (kind === 'sem') return '#ec4899'; if (kind === 'url') return '#06b6d4'; return '#7c5cff'; }
+function relColor(dir, kind) { if (dir === 'in') return '#3b82f6'; if (kind === 'prop') return '#10b981'; if (kind === 'tag') return '#f59e0b'; if (kind === 'sem') return '#ec4899'; if (kind === 'url') return '#06b6d4'; if (kind === 'virtual') return '#9ca3af'; return '#7c5cff'; }
 function layoutPlex(graph) {
   const nodes = []; const NW = 168, NH = 44;
   nodes.push({ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true });
@@ -244,7 +244,7 @@ class BrainView {
     const onDown = (e) => { cv.focus(); const p = rel(e); moved = false; downNode = this._nodeAt(p.x, p.y); mode = 'down'; sx = e.clientX; sy = e.clientY; cx0 = this.camera.x; cy0 = this.camera.y; try { cv.setPointerCapture(e.pointerId); } catch (_e) {} };
     const onMove = (e) => { const p = rel(e); if (mode === 'down' || mode === 'pan') { if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) { mode = 'pan'; moved = true; this.camera.x = cx0 - (e.clientX - sx) / this.camera.zoom; this.camera.y = cy0 - (e.clientY - sy) / this.camera.zoom; this.dirty = true; } } const h = this._nodeAt(p.x, p.y); if (h !== this._hover) { this._hover = h; this.dirty = true; cv.style.cursor = h ? 'pointer' : 'grab'; } };
     const onUp = (e) => {
-      if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url node opens externally
+      if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (downNode.kind === 'virtual') { /* unresolved — not navigable */ } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url opens externally; virtual is inert
       mode = null; downNode = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
     const onWheel = (e) => { e.preventDefault(); const p = rel(e); this.camera.zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0012)); this.dirty = true; };

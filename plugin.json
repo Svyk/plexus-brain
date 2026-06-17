@@ -1,6 +1,6 @@
 {
   "name": "Plexus Brain",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "type": "global_plugin",
   "icon": "ti-graph",
   "description": "Native Thymer TheBrain-style radial graph — derives a record's neighbourhood from backreferences + ref segments; click any node to refocus the plex.",
