@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.9.0';
+const BRAIN_VERSION = '0.10.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -72,11 +72,13 @@ async function deriveNeighbourhood(plugin, guid) {
       }
     }
   } catch (_e) {}
+  // P9: URL nodes — links written in the focus's text become external nodes (click opens them).
+  try { for (const li of (items || [])) { const segs = li.segments || []; for (const s of segs) { const tx = (typeof s.text === 'string') ? s.text : (s.text && (s.text.url || s.text.label)) || ''; for (const u of (String(tx).match(/https?:\/\/[^\s)]+/g) || [])) { if (!seen.has(u)) { seen.add(u); neighbours.push({ guid: u, title: u.replace(/^https?:\/\//, '').slice(0, 28), dir: 'out', kind: 'url', url: u }); } } } } } catch (_e) {}
   return { focus, neighbours };
 }
 // Radial layout: focus at (0,0), neighbours on rings around it.
 // Per-relation colour: incoming=blue, ref=purple, property=green, hashtag=amber.
-function relColor(dir, kind) { if (dir === 'in') return '#3b82f6'; if (kind === 'prop') return '#10b981'; if (kind === 'tag') return '#f59e0b'; if (kind === 'sem') return '#ec4899'; return '#7c5cff'; }
+function relColor(dir, kind) { if (dir === 'in') return '#3b82f6'; if (kind === 'prop') return '#10b981'; if (kind === 'tag') return '#f59e0b'; if (kind === 'sem') return '#ec4899'; if (kind === 'url') return '#06b6d4'; return '#7c5cff'; }
 function layoutPlex(graph) {
   const nodes = []; const NW = 168, NH = 44;
   nodes.push({ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true });
@@ -242,7 +244,7 @@ class BrainView {
     const onDown = (e) => { cv.focus(); const p = rel(e); moved = false; downNode = this._nodeAt(p.x, p.y); mode = 'down'; sx = e.clientX; sy = e.clientY; cx0 = this.camera.x; cy0 = this.camera.y; try { cv.setPointerCapture(e.pointerId); } catch (_e) {} };
     const onMove = (e) => { const p = rel(e); if (mode === 'down' || mode === 'pan') { if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) { mode = 'pan'; moved = true; this.camera.x = cx0 - (e.clientX - sx) / this.camera.zoom; this.camera.y = cy0 - (e.clientY - sy) / this.camera.zoom; this.dirty = true; } } const h = this._nodeAt(p.x, p.y); if (h !== this._hover) { this._hover = h; this.dirty = true; cv.style.cursor = h ? 'pointer' : 'grab'; } };
     const onUp = (e) => {
-      if (mode === 'down' && !moved && downNode) { if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); }
+      if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url node opens externally
       mode = null; downNode = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
     const onWheel = (e) => { e.preventDefault(); const p = rel(e); this.camera.zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0012)); this.dirty = true; };
