@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.6.0';
+const BRAIN_VERSION = '0.7.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -91,6 +91,14 @@ function layoutPlex(graph) {
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind }));
   return { nodes, edges };
 }
+// Phase 7: alternate layout — focus on top, neighbours in a grid below (hierarchical/tree feel).
+function layoutTree(graph) {
+  const NW = 180, NH = 44, cols = 4, gx = 206, gy = 66;
+  const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
+  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind }); });
+  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind }));
+  return { nodes, edges };
+}
 
 /* ───────── view ───────── */
 class BrainView {
@@ -101,6 +109,7 @@ class BrainView {
     this.graph = { nodes: [], edges: [] }; this._disposers = []; this._hover = null;
     this._history = []; this._hi = -1; // Phase 4 navigation history
     this._filter = { in: true, ref: true, prop: true, tag: true }; // Phase 5 kind filters
+    this._layoutMode = 'radial'; // Phase 7: 'radial' | 'tree'
   }
   mount() {
     try { this.panel.setTitle('Brain'); } catch (_e) {}
@@ -137,7 +146,8 @@ class BrainView {
     const f = this._filter || { in: true, ref: true, prop: true, tag: true };
     const kept = this._derived.neighbours.filter((n) => f[n.dir === 'in' ? 'in' : (n.kind || 'ref')] !== false);
     const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
-    this.graph = layoutPlex({ focus: this._derived.focus, neighbours: kept });
+    const lay = this._layoutMode === 'tree' ? layoutTree : layoutPlex;
+    this.graph = lay({ focus: this._derived.focus, neighbours: kept });
     for (const n of this.graph.nodes) { const p = prev.get(n.guid); n._fx = p ? p.x : 0; n._fy = p ? p.y : 0; }
     this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
     this._fit(); this.dirty = true; this._updateChrome();
@@ -149,6 +159,8 @@ class BrainView {
     const mkBtn = (txt, fn) => { const b = document.createElement('button'); b.className = 'pb-btn'; b.textContent = txt; b.addEventListener('click', fn); return b; };
     this._backBtn = mkBtn('‹', () => this._back()); this._fwdBtn = mkBtn('›', () => this._fwd());
     bar.appendChild(this._backBtn); bar.appendChild(this._fwdBtn);
+    this._layoutBtn = mkBtn('⊞', () => { this._layoutMode = this._layoutMode === 'tree' ? 'radial' : 'tree'; this._layoutBtn.textContent = this._layoutMode === 'tree' ? '◎' : '⊞'; this._layoutBtn.title = this._layoutMode === 'tree' ? 'Tree layout (click for radial)' : 'Radial layout (click for tree)'; this._relayout(); });
+    this._layoutBtn.title = 'Radial layout (click for tree)'; bar.appendChild(this._layoutBtn);
     this._crumbEl = document.createElement('span'); this._crumbEl.className = 'pb-crumb'; bar.appendChild(this._crumbEl);
     const sp = document.createElement('span'); sp.style.flex = '1'; bar.appendChild(sp);
     // Phase 5: relation-kind filter chips (colour-matched to relColor)
@@ -275,6 +287,15 @@ class Plugin extends AppPlugin {
         v._filter.tag = false; v._relayout(); await sleep(450); const afterNoTag = v.graph.nodes.length;
         v._filter.tag = true; v._relayout(); await sleep(450); const afterTag = v.graph.nodes.length;
         return { before, afterNoTag, afterTag, ok: afterNoTag < before && afterTag === before };
+      },
+      // Phase 7 alt layout: switch to tree -> a neighbour sits in the grid below (y>=100); back to radial.
+      layoutTest: async (guid) => {
+        let v = [...this._views].pop(); if (!v) { await this._open(guid); for (let i = 0; i < 40; i++) { await sleep(150); v = [...this._views].pop(); if (v) break; } }
+        if (!v) return { error: 'no view' }; await v.setFocus(guid);
+        if (v.graph.nodes.length < 2) return { error: 'no neighbours to lay out' };
+        v._layoutMode = 'tree'; v._relayout(); await sleep(400); const treeY = v.graph.nodes[1].y;
+        v._layoutMode = 'radial'; v._relayout(); await sleep(400); const radialY = v.graph.nodes[1].y;
+        return { treeNeighbourY: Math.round(treeY), radialNeighbourY: Math.round(radialY), ok: treeY >= 90 && treeY !== radialY };
       },
       // Phase 4 navigation: focus A, refocus to B, _back -> A, _fwd -> B. Reuses an existing view +
       // resets history (robust to panel saturation; doesn't depend on opening a fresh panel).
