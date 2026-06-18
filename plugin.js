@@ -6,10 +6,25 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.11.0';
+const BRAIN_VERSION = '0.12.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// IO-3: ONE shared ontology read by all three Plexus plugins (Canvas/Brain/Templater) so they agree on
+// collection names + relation tags. Default ⊕ localStorage['plexus_ontology'] override, hoisted to window.
+const PLEXUS_ONTOLOGY_DEFAULT = {
+  entityCollections: ['Projects', 'People', 'Books', 'Notes', 'Captures', 'Icons', 'Plexus Drawings'],
+  journalCollection: 'Journal', drawingsCollection: 'Plexus Drawings', iconsCollection: 'Icons',
+  templatesCollection: 'Templates', capturesCollection: 'Captures',
+  relationTags: { captured: 'captured', project: 'project', icon: 'icon' },
+};
+function loadPlexusOntology() {
+  try { if (typeof window !== 'undefined' && window.__plexusOntology) return window.__plexusOntology; } catch (_e) {}
+  let o; try { o = JSON.parse(JSON.stringify(PLEXUS_ONTOLOGY_DEFAULT)); } catch (_e) { o = PLEXUS_ONTOLOGY_DEFAULT; }
+  try { const ov = JSON.parse(localStorage.getItem('plexus_ontology') || '{}'); o = Object.assign(o, ov); } catch (_e) {}
+  try { if (typeof window !== 'undefined') window.__plexusOntology = o; } catch (_e) {}
+  return o;
+}
 
 /* ───────── camera ───────── */
 class Camera {
@@ -42,8 +57,18 @@ async function deriveNeighbourhood(plugin, guid) {
   if (!rec) return { focus: { guid, title: '(not found)' }, neighbours: [] };
   const focus = { guid, title: (rec.getName && rec.getName()) || 'Untitled' };
   const seen = new Set([guid]); const neighbours = [];
-  // incoming — records that link to the focus
-  try { const back = await rec.getBackReferenceRecords(); for (const r of (back || [])) { const g = r.guid; if (g && !seen.has(g)) { seen.add(g); neighbours.push({ guid: g, title: (r.getName && r.getName()) || 'Untitled', dir: 'in' }); } } } catch (_e) {}
+  // BP-1: incoming — detailed backrefs carry kind ('line'|'property'), propertyId, lineItemGuid, so we can
+  // distinguish a DEFINED relation (a record-type property pointing here) from an INFERRED one (a line ref).
+  try {
+    const back = await rec.getBackReferences();
+    for (const br of (back || [])) {
+      const r = br && br.record; const g = r && r.guid;
+      if (g && !seen.has(g)) { seen.add(g); neighbours.push({ guid: g, title: (r.getName && r.getName()) || 'Untitled', dir: 'in', bkind: br.kind, propertyId: br.propertyId || null, lineItemGuid: br.lineItemGuid || null }); }
+    }
+  } catch (_e) {
+    // fallback for any build without the detailed API
+    try { const back = await rec.getBackReferenceRecords(); for (const r of (back || [])) { const g = r.guid; if (g && !seen.has(g)) { seen.add(g); neighbours.push({ guid: g, title: (r.getName && r.getName()) || 'Untitled', dir: 'in' }); } } } catch (_e2) {}
+  }
   const addOut = async (g, kind) => {
     if (!g || seen.has(g)) return; seen.add(g);
     let title = 'Untitled'; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || title; else { if (kind === 'ref') neighbours.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual' }); return; } } catch (_e) { if (kind === 'ref') neighbours.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual' }); return; } // P9: virtual node for an unresolvable ref
@@ -296,6 +321,7 @@ class Plugin extends AppPlugin {
   onLoad() {
     try { window.__plexusBrain && window.__plexusBrain.dispose(); } catch (_e) {}
     this._views = new Set(); this._lastRecordGuid = null; this._raf = 0; this._disposers = [];
+    this._ontology = loadPlexusOntology(); // IO-3: shared collection/relation ontology
     window.__plexusBrain = { version: BRAIN_VERSION, dispose: () => this._teardown() };
     console.log('%c[Plexus Brain] v' + BRAIN_VERSION + ' loaded', 'color:#7c3aed;font-weight:bold');
     this.ui.injectCSS(BASE_CSS);
