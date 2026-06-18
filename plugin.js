@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.18.0';
+const BRAIN_VERSION = '0.19.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -467,8 +467,9 @@ class BrainView {
       mode = null; downNode = null; downGate = null; downTask = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
     const onWheel = (e) => { e.preventDefault(); const p = rel(e); this.camera.zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0012)); this.dirty = true; };
-    cv.addEventListener('pointerdown', onDown); cv.addEventListener('pointermove', onMove); cv.addEventListener('pointerup', onUp); cv.addEventListener('wheel', onWheel, { passive: false });
-    this._disposers.push(() => { cv.removeEventListener('pointerdown', onDown); cv.removeEventListener('pointermove', onMove); cv.removeEventListener('pointerup', onUp); cv.removeEventListener('wheel', onWheel); });
+    const onKey = (e) => { if (e.key === 'p' || e.key === 'P') { e.preventDefault(); this._pinned = !this._pinned; this.dirty = true; try { this.plugin.ui.addToaster({ title: this._pinned ? 'Plexus Brain: pinned (won’t auto-follow)' : 'Plexus Brain: following active record', dismissible: true }); } catch (_e) {} } }; // BS-10: pin toggle
+    cv.addEventListener('pointerdown', onDown); cv.addEventListener('pointermove', onMove); cv.addEventListener('pointerup', onUp); cv.addEventListener('wheel', onWheel, { passive: false }); cv.addEventListener('keydown', onKey);
+    this._disposers.push(() => { cv.removeEventListener('pointerdown', onDown); cv.removeEventListener('pointermove', onMove); cv.removeEventListener('pointerup', onUp); cv.removeEventListener('wheel', onWheel); cv.removeEventListener('keydown', onKey); });
   }
   async _openRecord(guid) {
     const ws = (this.plugin.getWorkspaceGuid && this.plugin.getWorkspaceGuid()) || this.plugin.workspaceGuid;
@@ -590,7 +591,9 @@ class Plugin extends AppPlugin {
     this.ui.registerCustomPanelType(PANEL_ID, (panel) => this._mount(panel));
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Open graph', icon: 'ti-graph', onSelected: () => this._open(this._lastRecordGuid) });
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Focus current note', icon: 'ti-graph', onSelected: () => { const r = this._activeRecord(); this._open(r); } });
-    const track = (e) => { try { const r = e.panel && e.panel.getActiveRecord && e.panel.getActiveRecord(); if (r && r.guid) this._lastRecordGuid = r.guid; } catch (_e) {} };
+    // BS-10: cross-plugin live companion — when you navigate to a record elsewhere, an OPEN Brain panel refocuses
+    // to it (unless that view is pinned). Makes the Brain track Canvas/editor focus automatically.
+    const track = (e) => { try { const r = e.panel && e.panel.getActiveRecord && e.panel.getActiveRecord(); if (r && r.guid) { this._lastRecordGuid = r.guid; for (const v of this._views) { if (!v._pinned && v.focusGuid && v.focusGuid !== r.guid) v.setFocus(r.guid); } } } catch (_e) {} };
     try { this.events.on('panel.focused', track); this.events.on('panel.navigated', track); } catch (_e) {}
     const onChange = (e) => { const g = e && e.recordGuid; for (const v of this._views) { if (!g || v.focusGuid === g || v.graph.nodes.some((n) => n.guid === g)) v.setFocus(v.focusGuid); } };
     try { for (const ev of ['record.updated', 'lineitem.updated', 'lineitem.created', 'lineitem.deleted']) this.events.on(ev, onChange); } catch (_e) {}
