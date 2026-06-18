@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.17.0';
+const BRAIN_VERSION = '0.18.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -127,11 +127,12 @@ async function deriveNeighbourhood(plugin, guid) {
   catch (_e) { try { back = ((await rec.getBackReferenceRecords()) || []).map((r) => ({ record: r, kind: 'line' })); } catch (_e2) { back = []; } }
   for (const br of (back || [])) {
     const r = br && br.record; const g = r && r.guid; if (!g || g === guid) continue;
-    const e = touch(g, (r.getName && r.getName()) || 'Untitled'); e.kinds.add('in');
+    const e = touch(g, (r.getName && r.getName()) || 'Untitled'); e.kinds.add('in'); e.rec = e.rec || r; // BS-2: keep record for skin
     if (br.kind === 'property' && br.propertyId) {
       e.propertyId = br.propertyId;
       const fld = resolveBackrefField(plugin, g, br.propertyId);
       const bucket = fld && fld.bucket;
+      if (fld && fld.label && bucket) e.label = e.label || fld.label; // BS-1: edge label = the relation field name
       if (bucket === 'parents') e.f.cd = true;        // source "parent: focus" ⇒ neighbour is focus's CHILD
       else if (bucket === 'children') e.f.pd = true;  // source "child: focus"  ⇒ neighbour is focus's PARENT
       else if (bucket === 'leftFriends') e.f.lfd = true;
@@ -151,10 +152,10 @@ async function deriveNeighbourhood(plugin, guid) {
   for (const li of (items || [])) { let st = null; try { st = li.getTaskStatus && li.getTaskStatus(); } catch (_e) {} if (st != null && st !== 'done') { focus.tasks.push({ guid: li.guid, text: lineTextOf(li) || '(task)', li }); if (focus.tasks.length >= 6) break; } }
   for (const g of refGuidsFromLineItems(items)) {
     if (g === guid) continue;
-    let title = null, resolved = true;
-    try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || null; else resolved = false; } catch (_e) { resolved = false; }
+    let title = null, resolved = true, trec = null;
+    try { trec = await plugin.data.getRecord(g); if (trec) title = (trec.getName && trec.getName()) || null; else resolved = false; } catch (_e) { resolved = false; }
     if (!resolved) { if (!seen.has(g) && !rels.has(g)) { seen.add(g); specials.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual', role: 'rightFriend', relType: 'INFERRED' }); } continue; }
-    const e = touch(g, title); e.kinds.add('ref'); e.f.ci = true;
+    const e = touch(g, title); e.kinds.add('ref'); e.f.ci = true; e.rec = e.rec || trec;
   }
 
   // OUTBOUND record-PROPERTY relations (focus → neighbour): bucket from the focus FIELD NAME (DEFINED).
@@ -170,8 +171,9 @@ async function deriveNeighbourhood(plugin, guid) {
       }
       for (const g of guids) {
         if (g === guid) continue;
-        let title = null; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || null; } catch (_e) {}
-        const e = touch(g, title); e.kinds.add('prop');
+        let title = null, trec = null; try { trec = await plugin.data.getRecord(g); if (trec) title = (trec.getName && trec.getName()) || null; } catch (_e) {}
+        const e = touch(g, title); e.kinds.add('prop'); e.rec = e.rec || trec;
+        if (bucket && pr && pr.name) e.label = e.label || pr.name; // BS-1: edge label = the relation field name
         if (bucket === 'parents') e.f.pd = true;
         else if (bucket === 'children') e.f.cd = true;
         else if (bucket === 'leftFriends') e.f.lfd = true;
@@ -204,7 +206,7 @@ async function deriveNeighbourhood(plugin, guid) {
   for (const e of rels.values()) {
     const rr = resolveRole(e.f); if (!rr) continue;
     const dir = (rr.role === 'parent') ? 'in' : 'out';
-    neighbours.push({ guid: e.guid, title: e.title, role: rr.role, relType: rr.type, dir, kind: [...e.kinds][0] || 'ref', propertyId: e.propertyId, lineItemGuid: e.lineItemGuid });
+    neighbours.push({ guid: e.guid, title: e.title, role: rr.role, relType: rr.type, dir, kind: [...e.kinds][0] || 'ref', label: e.label || ROLE_LABEL[rr.role] || '', skin: nodeSkin(e.rec), propertyId: e.propertyId, lineItemGuid: e.lineItemGuid });
   }
   for (const sp of specials) neighbours.push(sp);
 
@@ -242,6 +244,19 @@ async function deriveNeighbourhood(plugin, guid) {
 // BP-3: truth-table — collapse a neighbour's fat facet bag into ONE mutually-exclusive role (ExcaliBrain cases A–Q).
 // Facets: pi/pd parent-inferred/defined, ci/cd child, lfd/rfd left/right-friend-defined, pfd/nfd prev/next-defined,
 // lfi inferred friend (tag co-occurrence). DEFINED beats INFERRED; ≥2 defined OR mutual inferred parent+child ⇒ friend.
+const ROLE_LABEL = { parent: 'parent', child: 'child', leftFriend: 'friend', rightFriend: 'opposite', previous: 'previous', next: 'next', sibling: 'sibling' }; // BS-1: inferred-edge fallback labels
+// BS-2: ENUM_COLORS index → hex (red..yellow, per the SDK EnumColors table) for property-driven node skins.
+const ENUM_COLOR_HEX = ['#ef4444', '#f97316', '#22c55e', '#06b6d4', '#3b82f6', '#a855f7', '#ec4899', '#d946ef', '#f43f5e', '#78716c', '#14b8a6', '#0ea5e9', '#6366f1', '#71717a', '#eab308'];
+// BS-2: live node skin from a neighbour's OWN typed properties — Status→choice colour, Priority→size, Due→urgency.
+// Synchronous (reads props off a record we already fetched); recomputed every derive so it tracks property changes.
+function nodeSkin(rec) {
+  const skin = { color: null, scale: 1, urgent: false };
+  if (!rec || !rec.prop) return skin;
+  try { const sp = rec.prop('Status') || rec.prop('State'); if (sp && sp.choice) { const sel = sp.choice(); const opts = (sp.choices && sp.choices()) || []; const opt = (opts || []).find((o) => o && o.id === sel); if (opt && opt.color != null && ENUM_COLOR_HEX[+opt.color]) skin.color = ENUM_COLOR_HEX[+opt.color]; } } catch (_e) {}
+  try { const pp = rec.prop('Priority'); if (pp) { const L = String((pp.choiceLabel && pp.choiceLabel()) || (pp.text && pp.text()) || '').toLowerCase(); if (/high|urgent|critical|\bp0\b|\bp1\b/.test(L)) skin.scale = 1.16; else if (/low|\bp3\b|\bp4\b/.test(L)) skin.scale = 0.9; } } catch (_e) {}
+  try { const dp = rec.prop('Due') || rec.prop('Due Date') || rec.prop('Deadline'); if (dp && dp.date) { const d = dp.date(); if (d && d.getTime() < Date.now()) skin.urgent = true; } } catch (_e) {}
+  return skin;
+}
 function definedCount(f) { return [f.pd, f.cd, f.lfd, f.rfd, f.pfd, f.nfd].filter(Boolean).length; }
 function resolveRole(f) {
   if (!f) return null;
@@ -274,18 +289,18 @@ function layoutPlex(graph) {
   for (const nb of graph.neighbours) {
     const ring = Math.floor(i / perRing), idxInRing = i % perRing, countInRing = Math.min(perRing, n - ring * perRing);
     const R = R0 + ring * 200, a = (idxInRing / countInRing) * Math.PI * 2 - Math.PI / 2;
-    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType });
+    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin });
     i++;
   }
-  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType }));
+  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType, label: nd.label }));
   return { nodes, edges };
 }
 // Phase 7: alternate layout — focus on top, neighbours in a grid below (hierarchical/tree feel).
 function layoutTree(graph) {
   const NW = 180, NH = 44, cols = 4, gx = 206, gy = 66;
   const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
-  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); });
-  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType }));
+  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin }); });
+  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType, label: nd.label }));
   return { nodes, edges };
 }
 // BP-3/P8: which of the 4 cross-layout bands a neighbour belongs to (top-level so the view can filter/hit-test gates).
@@ -301,13 +316,13 @@ function layoutCross(graph) {
   for (const nb of graph.neighbours) b[crossBand(nb)].push(nb);
   const HSTEP = NW + 26, VSTEP = NH + 18, COLS = 6;
   const cap = (arr) => arr.length > CROSS_BAND_CAP ? arr.slice(0, CROSS_BAND_CAP) : arr;
-  const row = (arr, ySign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, a.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); }); };
-  const col = (arr, xSign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (a.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType })); };
+  const row = (arr, ySign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, a.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin }); }); };
+  const col = (arr, xSign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (a.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin })); };
   // BP-5: siblings cluster in the UPPER-RIGHT (ExcaliBrain convention), in its own compact grid.
-  const grid = (arr, key, x0, y0, cols) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / cols), ci = i % cols; nodes.push({ guid: nb.guid, title: nb.title, x: x0 + ci * (NW + 14), y: y0 + r * (NH + 14), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); }); };
+  const grid = (arr, key, x0, y0, cols) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / cols), ci = i % cols; nodes.push({ guid: nb.guid, title: nb.title, x: x0 + ci * (NW + 14), y: y0 + r * (NH + 14), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin }); }); };
   row(b.up, -1, 'up'); row(b.down, 1, 'down'); col(b.left, -1, 'left'); col(b.right, 1, 'right'); grid(b.sib, 'sib', 300, -330, 3);
   const m = {}; nodes.forEach((nd) => { m[nd.guid] = nd; });
-  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType })).filter((e) => e.to);
+  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin })).filter((e) => e.to);
   const ov = (arr) => Math.max(0, arr.length - CROSS_BAND_CAP);
   const bands = {
     up: { key: 'up', label: 'Parents', count: b.up.length, over: ov(b.up), ax: 0, ay: -120, role: 'parent', hidden: !!hidden.up },
@@ -482,16 +497,27 @@ class BrainView {
       const hx = ed.dir === 'in' ? f.x : tn.x, hy = ed.dir === 'in' ? f.y : tn.y, ox = ed.dir === 'in' ? tn.x : f.x, oy = ed.dir === 'in' ? tn.y : f.y;
       const ang = Math.atan2(hy - oy, hx - ox), aw = 9 / z;
       ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(hx - aw * Math.cos(ang - 0.4), hy - aw * Math.sin(ang - 0.4)); ctx.lineTo(hx - aw * Math.cos(ang + 0.4), hy - aw * Math.sin(ang + 0.4)); ctx.closePath(); ctx.fillStyle = relColor(ed.role, ed.kind); ctx.fill();
+      // BS-1: typed-edge label — the relation's FIELD NAME on DEFINED edges (inferred stay unlabeled to avoid clutter).
+      if (ed.label && ed.relType === 'DEFINED' && z > 0.55) {
+        const mx = (f.x + tn.x) / 2, my = (f.y + tn.y) / 2;
+        ctx.font = '600 11px system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+        const lbl = this._clip(ctx, ed.label, 130), tw = ctx.measureText(lbl).width;
+        ctx.globalAlpha = 0.96; ctx.fillStyle = '#0d1320';
+        ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(mx - tw / 2 - 5, my - 9, tw + 10, 18, 5); else ctx.rect(mx - tw / 2 - 5, my - 9, tw + 10, 18); ctx.fill();
+        ctx.fillStyle = relColor(ed.role, ed.kind); ctx.fillText(lbl, mx, my); ctx.textAlign = 'left';
+      }
     }
     ctx.globalAlpha = 1;
     // nodes
     for (const nd of this.graph.nodes) {
-      const P = pos(nd); const x = P.x - nd.w / 2, y = P.y - nd.h / 2; const rad = 9;
-      ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, nd.w, nd.h, rad); else ctx.rect(x, y, nd.w, nd.h);
+      const sk = nd.skin || {}; const sc = nd.focus ? 1 : (sk.scale || 1); // BS-2: Priority scales the node
+      const w = nd.w * sc, h = nd.h * sc; const P = pos(nd); const x = P.x - w / 2, y = P.y - h / 2; const rad = 9;
+      if (sk.urgent && !nd.focus) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x - 4, y - 4, w + 8, h + 8, rad + 3); else ctx.rect(x - 4, y - 4, w + 8, h + 8); ctx.lineWidth = 2.5 / z; ctx.strokeStyle = '#ef4444'; ctx.globalAlpha = 0.85; ctx.stroke(); ctx.globalAlpha = 1; } // Due-past urgency ring
+      ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, rad); else ctx.rect(x, y, w, h);
       ctx.fillStyle = nd.focus ? '#7c5cff' : '#1b2030'; ctx.fill();
-      ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = nd.focus ? '#a78bfa' : relColor(nd.role, nd.kind); ctx.stroke();
+      ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = nd.focus ? '#a78bfa' : (sk.color || relColor(nd.role, nd.kind)); ctx.stroke(); // Status choice colour overrides
       ctx.fillStyle = nd.focus ? '#ffffff' : '#e6e8ee'; ctx.font = (nd.focus ? '600 15px' : '13px') + ' system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
-      ctx.fillText(this._clip(ctx, nd.title, nd.w - 18), P.x, P.y);
+      ctx.fillText(this._clip(ctx, nd.title, w - 18), P.x, P.y);
     }
     // BP-4: directional gate headers (cross layout only) — label · count (+overflow), click to collapse/expand the band.
     this._gateRects = [];
