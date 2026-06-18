@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.25.0';
+const BRAIN_VERSION = '0.26.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -665,6 +665,7 @@ class Plugin extends AppPlugin {
     this.ui.registerCustomPanelType(PANEL_ID, (panel) => this._mount(panel));
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Open graph', icon: 'ti-graph', onSelected: () => this._open(this._lastRecordGuid) });
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Focus current note', icon: 'ti-graph', onSelected: () => { const r = this._activeRecord(); this._open(r); } });
+    this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Edit ontology (relation field names)', icon: 'ti-list-tree', onSelected: () => this._editOntology() }); // BP-7
     // BS-10: cross-plugin live companion — when you navigate to a record elsewhere, an OPEN Brain panel refocuses
     // to it (unless that view is pinned). Makes the Brain track Canvas/editor focus automatically.
     const track = (e) => { try { const r = e.panel && e.panel.getActiveRecord && e.panel.getActiveRecord(); if (r && r.guid) { this._lastRecordGuid = r.guid; for (const v of this._views) { if (!v._pinned && v.focusGuid && v.focusGuid !== r.guid) v.setFocus(r.guid); } } } catch (_e) {} };
@@ -680,6 +681,37 @@ class Plugin extends AppPlugin {
   _activeRecord() { try { const p = this.ui.getActivePanel(); const r = p && p.getActiveRecord && p.getActiveRecord(); return (r && r.guid) || this._lastRecordGuid; } catch (_e) { return this._lastRecordGuid; } }
   // BP-2: build the field-resolution index once. Field schema (cheap) is awaited; the expensive recordGuid→collection
   // map builds in the BACKGROUND so the graph never blocks — DEFINED-relation enrichment lights up when it's ready.
+  // BP-7: ontology editor — edit the shared relation field-name buckets; persists to localStorage['plexus_ontology']
+  // (the IO-3 shared source) and rebuilds the field index. Canvas/Templater pick it up on their next load.
+  _editOntology() {
+    const ont = this._ontology || loadPlexusOntology(); const rb = ont.relationBuckets || {};
+    const ov = document.createElement('div'); ov.style.cssText = 'position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.5)';
+    const box = document.createElement('div'); box.style.cssText = 'background:var(--cards-bg,#1b2030);color:var(--color-text-400,#e6e8ee);border:1px solid var(--cards-border-color,rgba(255,255,255,.12));border-radius:12px;padding:18px 20px;min-width:460px;max-width:640px;max-height:80vh;overflow:auto;font-family:system-ui,sans-serif';
+    box.innerHTML = '<div style="font-size:15px;font-weight:600;margin:0 0 4px">Plexus Ontology — relation field names</div><div style="font-size:12px;opacity:.7;margin-bottom:12px">Comma-separated property field labels per relation category. The Brain maps a typed record-property to a category by its field name.</div>';
+    const fields = {};
+    for (const k of ['parents', 'children', 'leftFriends', 'rightFriends', 'previous', 'next']) {
+      const lab = document.createElement('label'); lab.style.cssText = 'display:block;font-size:12px;margin:8px 0 2px;font-weight:600'; lab.textContent = k;
+      const inp = document.createElement('input'); inp.type = 'text'; inp.value = (rb[k] || []).join(', '); inp.style.cssText = 'width:100%;box-sizing:border-box;background:var(--input-bg-color,rgba(0,0,0,.25));color:var(--color-text-400,#e6e8ee);border:1px solid var(--cards-border-color,rgba(255,255,255,.12));border-radius:6px;padding:7px 9px;font-size:13px';
+      box.appendChild(lab); box.appendChild(inp); fields[k] = inp;
+    }
+    const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:16px';
+    const cancel = document.createElement('button'); cancel.textContent = 'Cancel'; cancel.style.cssText = 'padding:7px 14px;border-radius:6px;border:1px solid var(--cards-border-color,rgba(255,255,255,.12));background:transparent;color:inherit;cursor:pointer';
+    const save = document.createElement('button'); save.textContent = 'Save'; save.style.cssText = 'padding:7px 14px;border-radius:6px;border:none;background:#7c3aed;color:#fff;cursor:pointer';
+    cancel.addEventListener('click', () => ov.remove());
+    save.addEventListener('click', () => {
+      const override = JSON.parse(JSON.stringify(this._ontology || loadPlexusOntology())); override.relationBuckets = override.relationBuckets || {};
+      for (const k in fields) override.relationBuckets[k] = fields[k].value.split(',').map((s) => s.trim()).filter(Boolean);
+      try { localStorage.setItem('plexus_ontology', JSON.stringify(override)); } catch (_e) {}
+      try { window.__plexusOntology = override; } catch (_e) {}
+      this._ontology = override; this._indexBuilt = false; // rebuild the field index with the new buckets
+      for (const v of this._views) v.setFocus(v.focusGuid);
+      ov.remove();
+      try { this.ui.addToaster({ title: 'Ontology saved. Reload Canvas/Templater to share the change.', dismissible: true }); } catch (_e) {}
+    });
+    row.appendChild(cancel); row.appendChild(save); box.appendChild(row);
+    ov.appendChild(box); ov.addEventListener('click', (e) => { if (e.target === ov) ov.remove(); });
+    document.body.appendChild(ov);
+  }
   async _ensureIndex() {
     if (this._indexBuilt) return;
     this._indexBuilt = true;
