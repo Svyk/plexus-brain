@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.21.0';
+const BRAIN_VERSION = '0.22.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -345,7 +345,7 @@ class BrainView {
     this.focusGuid = focusGuid; this.camera = new Camera(-400, -300, 1);
     this.dpr = Math.max(1, window.devicePixelRatio || 1); this.dirty = true; this.destroyed = false;
     this.graph = { nodes: [], edges: [] }; this._disposers = []; this._hover = null;
-    this._history = []; this._hi = -1; // Phase 4 navigation history
+    this._history = []; this._hi = -1; this._loadHistory(); // Phase 4 nav history; BP-6: restore persisted history
     this._filter = { in: true, ref: true, prop: true, tag: true, sem: false }; // Phase 5/6 kind filters (sem opt-in)
     this._layoutMode = 'radial'; // Phase 7: 'radial' | 'tree'
   }
@@ -373,7 +373,13 @@ class BrainView {
   }
   async setFocus(guid, nav) {
     this.focusGuid = guid;
-    if (!nav) { this._history = this._history.slice(0, this._hi + 1); if (this._history[this._hi] !== guid) { this._history.push(guid); this._hi = this._history.length - 1; } }
+    if (!nav) {
+      this._history = this._history.slice(0, this._hi + 1);
+      if (this._history[this._hi] !== guid) { this._history.push(guid); this._hi = this._history.length - 1; }
+      // BP-6: cap at 50 (MRU) + persist so navigation history survives a panel close / reload.
+      if (this._history.length > 50) { const drop = this._history.length - 50; this._history.splice(0, drop); this._hi -= drop; }
+      this._saveHistory();
+    }
     try { await this.plugin._ensureIndex(); } catch (_e) {} // BP-2: field index ready before derive (recColMap fills in async)
     this._derived = await deriveNeighbourhood(this.plugin, guid);
     if (this.destroyed) return;
@@ -443,8 +449,11 @@ class BrainView {
     if (this._fwdBtn) this._fwdBtn.disabled = this._hi >= this._history.length - 1;
     if (this._crumbEl) { const t = (this.graph.nodes[0] && this.graph.nodes[0].title) || ''; this._crumbEl.textContent = t + (this._history.length > 1 ? '  ·  ' + (this._hi + 1) + '/' + this._history.length : ''); }
   }
-  _back() { if (this._hi > 0) { this._hi--; this.setFocus(this._history[this._hi], true); } }
-  _fwd() { if (this._hi < this._history.length - 1) { this._hi++; this.setFocus(this._history[this._hi], true); } }
+  _back() { if (this._hi > 0) { this._hi--; this.setFocus(this._history[this._hi], true); this._saveHistory(); } }
+  _fwd() { if (this._hi < this._history.length - 1) { this._hi++; this.setFocus(this._history[this._hi], true); this._saveHistory(); } }
+  // BP-6: persist the navigation history (guids + cursor) so it survives a panel close / reload.
+  _saveHistory() { try { localStorage.setItem('plexus_brain_history', JSON.stringify({ h: this._history.slice(-50), i: this._hi })); } catch (_e) {} }
+  _loadHistory() { try { const s = JSON.parse(localStorage.getItem('plexus_brain_history') || 'null'); if (s && Array.isArray(s.h)) { this._history = s.h.filter((g) => typeof g === 'string'); this._hi = Math.max(-1, Math.min(this._history.length - 1, s.i == null ? this._history.length - 1 : s.i)); } } catch (_e) {} }
   async _searchFocus(q) { q = (q || '').trim(); if (!q) return; try { const res = await this.plugin.data.searchByQuery(q, 5); const r = (res && res.records && res.records[0]); if (r && r.guid) { this.setFocus(r.guid); this._searchInp.value = ''; } else { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: no record matched "' + q + '".', dismissible: true }); } catch (_e) {} } } catch (_e) {} }
   _fit() {
     const nodes = this.graph.nodes; if (!nodes.length) return;
