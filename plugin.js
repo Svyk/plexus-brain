@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.20.0';
+const BRAIN_VERSION = '0.21.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -467,6 +467,7 @@ class BrainView {
     const onUp = (e) => {
       if (mode === 'down' && !moved && downTask) { this._toggleFocusTask(downTask); } // IO-4: complete a focus task in-graph
       else if (mode === 'down' && !moved && downGate) { if (!this._gateHidden) this._gateHidden = {}; this._gateHidden[downGate] = !this._gateHidden[downGate]; this._relayout(); } // BP-4: toggle band
+      else if (mode === 'down' && !moved && downNode && e.altKey && !downNode.focus && downNode.kind !== 'url' && downNode.kind !== 'virtual') { this._promoteRelation(downNode.guid); } // BS-4: Alt-click writes a real relation
       else if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (downNode.kind === 'virtual') { /* unresolved — not navigable */ } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url opens externally; virtual is inert
       mode = null; downNode = null; downGate = null; downTask = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
@@ -477,6 +478,19 @@ class BrainView {
     };
     cv.addEventListener('pointerdown', onDown); cv.addEventListener('pointermove', onMove); cv.addEventListener('pointerup', onUp); cv.addEventListener('wheel', onWheel, { passive: false }); cv.addEventListener('keydown', onKey);
     this._disposers.push(() => { cv.removeEventListener('pointerdown', onDown); cv.removeEventListener('pointermove', onMove); cv.removeEventListener('pointerup', onUp); cv.removeEventListener('wheel', onWheel); cv.removeEventListener('keydown', onKey); });
+  }
+  // BS-4: promote an inferred/semantic neighbour to a DEFINED relation — write a record-relation property on the
+  // focus pointing at the target, then re-derive so the ghost edge becomes a real typed edge. The Brain as a BUILDER.
+  async _promoteRelation(targetGuid) {
+    if (!this.focusGuid || !targetGuid || targetGuid === this.focusGuid) return;
+    try {
+      const rec = await this.plugin.data.getRecord(this.focusGuid); if (!rec || !rec.prop) return;
+      const p = rec.prop('Related') || rec.prop('Friends') || rec.prop('Links') || rec.prop('See Also');
+      if (!p) { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: focus has no Related/Friends/Links relation property to write.', dismissible: true }); } catch (_e) {} return; }
+      if (p.addValue) p.addValue(targetGuid); else if (p.set) p.set(targetGuid);
+      try { this.plugin.ui.addToaster({ title: 'Linked as a real relation — re-deriving.', dismissible: true }); } catch (_e) {}
+      this.setFocus(this.focusGuid); // re-derive: the edge is now a DEFINED relation
+    } catch (e) { console.error('[Plexus Brain] promoteRelation', e); }
   }
   async _openRecord(guid) {
     const ws = (this.plugin.getWorkspaceGuid && this.plugin.getWorkspaceGuid()) || this.plugin.workspaceGuid;
