@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.19.0';
+const BRAIN_VERSION = '0.20.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -94,6 +94,10 @@ async function buildRecordCollectionMap(plugin, fieldIndex) {
   }
   return map;
 }
+// BS-6: a record's collection name (via the BP-2 recordGuid→collection map + field index) + a stable colour for it.
+function collectionNameOf(plugin, guid) { try { const cg = plugin._recColMap && plugin._recColMap[guid]; if (!cg) return null; const c = plugin._fieldIndex && plugin._fieldIndex.byGuid[cg]; return (c && c.name) || null; } catch (_e) { return null; } }
+const COLLECTION_PALETTE = ['#3b82f6', '#10b981', '#f59e0b', '#a855f7', '#ec4899', '#06b6d4', '#ef4444', '#14b8a6', '#6366f1', '#eab308'];
+function colorForString(s) { let h = 0; const str = String(s || ''); for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0; return COLLECTION_PALETTE[Math.abs(h) % COLLECTION_PALETTE.length]; }
 // Resolve a backref's (sourceRecordGuid, propertyId) → { label, isRelation, bucket } using the indexes.
 function resolveBackrefField(plugin, sourceGuid, propertyId) {
   if (!propertyId || !plugin._fieldIndex || !plugin._recColMap) return null;
@@ -206,7 +210,7 @@ async function deriveNeighbourhood(plugin, guid) {
   for (const e of rels.values()) {
     const rr = resolveRole(e.f); if (!rr) continue;
     const dir = (rr.role === 'parent') ? 'in' : 'out';
-    neighbours.push({ guid: e.guid, title: e.title, role: rr.role, relType: rr.type, dir, kind: [...e.kinds][0] || 'ref', label: e.label || ROLE_LABEL[rr.role] || '', skin: nodeSkin(e.rec), propertyId: e.propertyId, lineItemGuid: e.lineItemGuid });
+    neighbours.push({ guid: e.guid, title: e.title, role: rr.role, relType: rr.type, dir, kind: [...e.kinds][0] || 'ref', label: e.label || ROLE_LABEL[rr.role] || '', skin: nodeSkin(e.rec), collection: collectionNameOf(plugin, e.guid), propertyId: e.propertyId, lineItemGuid: e.lineItemGuid });
   }
   for (const sp of specials) neighbours.push(sp);
 
@@ -289,7 +293,7 @@ function layoutPlex(graph) {
   for (const nb of graph.neighbours) {
     const ring = Math.floor(i / perRing), idxInRing = i % perRing, countInRing = Math.min(perRing, n - ring * perRing);
     const R = R0 + ring * 200, a = (idxInRing / countInRing) * Math.PI * 2 - Math.PI / 2;
-    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin });
+    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection });
     i++;
   }
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType, label: nd.label }));
@@ -299,7 +303,7 @@ function layoutPlex(graph) {
 function layoutTree(graph) {
   const NW = 180, NH = 44, cols = 4, gx = 206, gy = 66;
   const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
-  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin }); });
+  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection }); });
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType, label: nd.label }));
   return { nodes, edges };
 }
@@ -316,13 +320,13 @@ function layoutCross(graph) {
   for (const nb of graph.neighbours) b[crossBand(nb)].push(nb);
   const HSTEP = NW + 26, VSTEP = NH + 18, COLS = 6;
   const cap = (arr) => arr.length > CROSS_BAND_CAP ? arr.slice(0, CROSS_BAND_CAP) : arr;
-  const row = (arr, ySign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, a.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin }); }); };
-  const col = (arr, xSign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (a.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin })); };
+  const row = (arr, ySign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, a.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection }); }); };
+  const col = (arr, xSign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (a.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection })); };
   // BP-5: siblings cluster in the UPPER-RIGHT (ExcaliBrain convention), in its own compact grid.
-  const grid = (arr, key, x0, y0, cols) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / cols), ci = i % cols; nodes.push({ guid: nb.guid, title: nb.title, x: x0 + ci * (NW + 14), y: y0 + r * (NH + 14), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin }); }); };
+  const grid = (arr, key, x0, y0, cols) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / cols), ci = i % cols; nodes.push({ guid: nb.guid, title: nb.title, x: x0 + ci * (NW + 14), y: y0 + r * (NH + 14), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection }); }); };
   row(b.up, -1, 'up'); row(b.down, 1, 'down'); col(b.left, -1, 'left'); col(b.right, 1, 'right'); grid(b.sib, 'sib', 300, -330, 3);
   const m = {}; nodes.forEach((nd) => { m[nd.guid] = nd; });
-  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin })).filter((e) => e.to);
+  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection })).filter((e) => e.to);
   const ov = (arr) => Math.max(0, arr.length - CROSS_BAND_CAP);
   const bands = {
     up: { key: 'up', label: 'Parents', count: b.up.length, over: ov(b.up), ax: 0, ay: -120, role: 'parent', hidden: !!hidden.up },
@@ -467,7 +471,10 @@ class BrainView {
       mode = null; downNode = null; downGate = null; downTask = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
     const onWheel = (e) => { e.preventDefault(); const p = rel(e); this.camera.zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0012)); this.dirty = true; };
-    const onKey = (e) => { if (e.key === 'p' || e.key === 'P') { e.preventDefault(); this._pinned = !this._pinned; this.dirty = true; try { this.plugin.ui.addToaster({ title: this._pinned ? 'Plexus Brain: pinned (won’t auto-follow)' : 'Plexus Brain: following active record', dismissible: true }); } catch (_e) {} } }; // BS-10: pin toggle
+    const onKey = (e) => {
+      if (e.key === 'p' || e.key === 'P') { e.preventDefault(); this._pinned = !this._pinned; this.dirty = true; try { this.plugin.ui.addToaster({ title: this._pinned ? 'Plexus Brain: pinned (won’t auto-follow)' : 'Plexus Brain: following active record', dismissible: true }); } catch (_e) {} } // BS-10: pin toggle
+      else if (e.key === 'c' || e.key === 'C') { e.preventDefault(); this._colorMode = this._colorMode === 'collection' ? 'role' : 'collection'; this.dirty = true; try { this.plugin.ui.addToaster({ title: 'Plexus Brain: colour by ' + (this._colorMode === 'collection' ? 'COLLECTION' : 'relation role'), dismissible: true }); } catch (_e) {} } // BS-6: colour mode
+    };
     cv.addEventListener('pointerdown', onDown); cv.addEventListener('pointermove', onMove); cv.addEventListener('pointerup', onUp); cv.addEventListener('wheel', onWheel, { passive: false }); cv.addEventListener('keydown', onKey);
     this._disposers.push(() => { cv.removeEventListener('pointerdown', onDown); cv.removeEventListener('pointermove', onMove); cv.removeEventListener('pointerup', onUp); cv.removeEventListener('wheel', onWheel); cv.removeEventListener('keydown', onKey); });
   }
@@ -516,9 +523,13 @@ class BrainView {
       if (sk.urgent && !nd.focus) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x - 4, y - 4, w + 8, h + 8, rad + 3); else ctx.rect(x - 4, y - 4, w + 8, h + 8); ctx.lineWidth = 2.5 / z; ctx.strokeStyle = '#ef4444'; ctx.globalAlpha = 0.85; ctx.stroke(); ctx.globalAlpha = 1; } // Due-past urgency ring
       ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, rad); else ctx.rect(x, y, w, h);
       ctx.fillStyle = nd.focus ? '#7c5cff' : '#1b2030'; ctx.fill();
-      ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = nd.focus ? '#a78bfa' : (sk.color || relColor(nd.role, nd.kind)); ctx.stroke(); // Status choice colour overrides
+      // BS-6: in 'collection' colour mode the border is the collection colour; else Status skin or role colour.
+      const border = nd.focus ? '#a78bfa' : (this._colorMode === 'collection' && nd.collection ? colorForString(nd.collection) : (sk.color || relColor(nd.role, nd.kind)));
+      ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = border; ctx.stroke();
       ctx.fillStyle = nd.focus ? '#ffffff' : '#e6e8ee'; ctx.font = (nd.focus ? '600 15px' : '13px') + ' system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
       ctx.fillText(this._clip(ctx, nd.title, w - 18), P.x, P.y);
+      // BS-6: collection dot (top-left corner) — a stable per-collection colour, the grouping cue.
+      if (!nd.focus && nd.collection) { ctx.beginPath(); ctx.arc(x + 9, y + 9, 3.4, 0, Math.PI * 2); ctx.fillStyle = colorForString(nd.collection); ctx.fill(); }
     }
     // BP-4: directional gate headers (cross layout only) — label · count (+overflow), click to collapse/expand the band.
     this._gateRects = [];
