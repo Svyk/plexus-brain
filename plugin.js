@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.16.0';
+const BRAIN_VERSION = '0.17.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -207,6 +207,36 @@ async function deriveNeighbourhood(plugin, guid) {
     neighbours.push({ guid: e.guid, title: e.title, role: rr.role, relType: rr.type, dir, kind: [...e.kinds][0] || 'ref', propertyId: e.propertyId, lineItemGuid: e.lineItemGuid });
   }
   for (const sp of specials) neighbours.push(sp);
+
+  // BP-5: siblings — second-order, the CHILDREN of focus's parents (excluding focus + anything already shown).
+  // Bounded (≤4 parents, ≤12 siblings) so a huge graph stays fast; this runs once per focus, never per frame.
+  const parents = neighbours.filter((n) => n.role === 'parent').slice(0, 4);
+  if (parents.length) {
+    const known = new Set([guid, ...neighbours.map((n) => n.guid)]);
+    const sibGuids = [];
+    for (const p of parents) {
+      if (sibGuids.length >= 12) break;
+      try {
+        const pr = await plugin.data.getRecord(p.guid); if (!pr) continue;
+        const pitems = await pr.getLineItems();
+        const childGuids = new Set(refGuidsFromLineItems(pitems)); // parent's inferred children (its outbound refs)
+        const pprops = (pr.getAllProperties && pr.getAllProperties()) || [];
+        for (const prop of pprops) {
+          if (bucketOfFieldLabel(ont, prop && prop.name) !== 'children') continue;
+          let raw = null; try { raw = prop.values && prop.values(); } catch (_e) {}
+          for (const v of (raw || [])) {
+            if (typeof v === 'string') { if (v[0] === '[') { try { for (const g of JSON.parse(v)) if (typeof g === 'string') childGuids.add(g); } catch (_e) {} } else if (/^[0-9A-Z]{12,}$/.test(v)) childGuids.add(v); }
+            else if (v && typeof v === 'object' && v.guid) childGuids.add(v.guid);
+          }
+        }
+        for (const g of childGuids) { if (g && !known.has(g)) { known.add(g); sibGuids.push(g); if (sibGuids.length >= 12) break; } }
+      } catch (_e) {}
+    }
+    for (const g of sibGuids) {
+      let title = null; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || null; } catch (_e) {}
+      neighbours.push({ guid: g, title: title || 'Untitled', role: 'sibling', relType: 'INFERRED', dir: 'out', kind: 'sibling' });
+    }
+  }
   return { focus, neighbours };
 }
 // BP-3: truth-table — collapse a neighbour's fat facet bag into ONE mutually-exclusive role (ExcaliBrain cases A–Q).
@@ -231,7 +261,7 @@ function resolveRole(f) {
 // Per-ROLE colour: parent=blue, child=green, friend=purple, right-friend/next=amber, url=cyan, virtual=grey, sem=pink.
 function relColor(role, kind) {
   if (kind === 'url') return '#06b6d4'; if (kind === 'virtual') return '#9ca3af'; if (kind === 'sem') return '#ec4899';
-  if (role === 'parent') return '#3b82f6'; if (role === 'child') return '#10b981';
+  if (role === 'parent') return '#3b82f6'; if (role === 'child') return '#10b981'; if (role === 'sibling') return '#14b8a6';
   if (role === 'rightFriend' || role === 'next') return '#f59e0b';
   return '#7c5cff'; // leftFriend / previous / fallback
 }
@@ -259,7 +289,7 @@ function layoutTree(graph) {
   return { nodes, edges };
 }
 // BP-3/P8: which of the 4 cross-layout bands a neighbour belongs to (top-level so the view can filter/hit-test gates).
-function crossBand(nb) { const r = nb.role; if (r === 'parent') return 'up'; if (r === 'child') return 'down'; if (r === 'rightFriend' || r === 'next') return 'right'; if (r === 'leftFriend' || r === 'previous') return 'left'; if (nb.kind === 'url' || nb.kind === 'virtual') return 'right'; return 'left'; }
+function crossBand(nb) { const r = nb.role; if (r === 'parent') return 'up'; if (r === 'child') return 'down'; if (r === 'sibling') return 'sib'; if (r === 'rightFriend' || r === 'next') return 'right'; if (r === 'leftFriend' || r === 'previous') return 'left'; if (nb.kind === 'url' || nb.kind === 'virtual') return 'right'; return 'left'; }
 const CROSS_BAND_CAP = 30; // BP-5: per-band node cap; overflow surfaces as a "+k" badge on the gate.
 // BP-3/P8/BP-4: structured cross layout — parents UP, children DOWN, friends LEFT, opposites/links RIGHT,
 // with per-band caps and gate metadata (label + count + overflow + anchor) for the directional gate headers.
@@ -267,13 +297,15 @@ function layoutCross(graph) {
   const NW = 172, NH = 44;
   const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
   const hidden = graph.hidden || {}; // BP-4: gate-collapsed bands keep their COUNT but place no nodes
-  const b = { up: [], down: [], left: [], right: [] };
+  const b = { up: [], down: [], left: [], right: [], sib: [] };
   for (const nb of graph.neighbours) b[crossBand(nb)].push(nb);
   const HSTEP = NW + 26, VSTEP = NH + 18, COLS = 6;
   const cap = (arr) => arr.length > CROSS_BAND_CAP ? arr.slice(0, CROSS_BAND_CAP) : arr;
   const row = (arr, ySign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, a.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); }); };
   const col = (arr, xSign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (a.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType })); };
-  row(b.up, -1, 'up'); row(b.down, 1, 'down'); col(b.left, -1, 'left'); col(b.right, 1, 'right');
+  // BP-5: siblings cluster in the UPPER-RIGHT (ExcaliBrain convention), in its own compact grid.
+  const grid = (arr, key, x0, y0, cols) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / cols), ci = i % cols; nodes.push({ guid: nb.guid, title: nb.title, x: x0 + ci * (NW + 14), y: y0 + r * (NH + 14), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); }); };
+  row(b.up, -1, 'up'); row(b.down, 1, 'down'); col(b.left, -1, 'left'); col(b.right, 1, 'right'); grid(b.sib, 'sib', 300, -330, 3);
   const m = {}; nodes.forEach((nd) => { m[nd.guid] = nd; });
   const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType })).filter((e) => e.to);
   const ov = (arr) => Math.max(0, arr.length - CROSS_BAND_CAP);
@@ -282,6 +314,7 @@ function layoutCross(graph) {
     down: { key: 'down', label: 'Children', count: b.down.length, over: ov(b.down), ax: 0, ay: 120, role: 'child', hidden: !!hidden.down },
     left: { key: 'left', label: 'Friends', count: b.left.length, over: ov(b.left), ax: -200, ay: 0, role: 'leftFriend', hidden: !!hidden.left },
     right: { key: 'right', label: 'Opposites · Links', count: b.right.length, over: ov(b.right), ax: 200, ay: 0, role: 'rightFriend', hidden: !!hidden.right },
+    sib: { key: 'sib', label: 'Siblings', count: b.sib.length, over: ov(b.sib), ax: 380, ay: -290, role: 'sibling', hidden: !!hidden.sib },
   };
   return { nodes, edges, bands };
 }
