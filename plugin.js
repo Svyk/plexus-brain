@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.14.0';
+const BRAIN_VERSION = '0.15.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -255,21 +255,32 @@ function layoutTree(graph) {
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType }));
   return { nodes, edges };
 }
-// BP-3/P8: structured cross layout — parents UP, children DOWN, left-friends/previous LEFT, right-friends/next RIGHT.
-// Roles come from the truth-table (nb.role), not dir/kind guesses.
+// BP-3/P8: which of the 4 cross-layout bands a neighbour belongs to (top-level so the view can filter/hit-test gates).
+function crossBand(nb) { const r = nb.role; if (r === 'parent') return 'up'; if (r === 'child') return 'down'; if (r === 'rightFriend' || r === 'next') return 'right'; if (r === 'leftFriend' || r === 'previous') return 'left'; if (nb.kind === 'url' || nb.kind === 'virtual') return 'right'; return 'left'; }
+const CROSS_BAND_CAP = 30; // BP-5: per-band node cap; overflow surfaces as a "+k" badge on the gate.
+// BP-3/P8/BP-4: structured cross layout — parents UP, children DOWN, friends LEFT, opposites/links RIGHT,
+// with per-band caps and gate metadata (label + count + overflow + anchor) for the directional gate headers.
 function layoutCross(graph) {
   const NW = 172, NH = 44;
   const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
-  const band = (nb) => { const r = nb.role; if (r === 'parent') return 'up'; if (r === 'child') return 'down'; if (r === 'rightFriend' || r === 'next') return 'right'; if (r === 'leftFriend' || r === 'previous') return 'left'; if (nb.kind === 'url' || nb.kind === 'virtual') return 'right'; return 'left'; };
+  const hidden = graph.hidden || {}; // BP-4: gate-collapsed bands keep their COUNT but place no nodes
   const b = { up: [], down: [], left: [], right: [] };
-  for (const nb of graph.neighbours) b[band(nb)].push(nb);
+  for (const nb of graph.neighbours) b[crossBand(nb)].push(nb);
   const HSTEP = NW + 26, VSTEP = NH + 18, COLS = 6;
-  const row = (arr, ySign) => arr.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, arr.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); });
-  const col = (arr, xSign) => arr.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (arr.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }));
-  row(b.up, -1); row(b.down, 1); col(b.left, -1); col(b.right, 1);
+  const cap = (arr) => arr.length > CROSS_BAND_CAP ? arr.slice(0, CROSS_BAND_CAP) : arr;
+  const row = (arr, ySign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, a.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); }); };
+  const col = (arr, xSign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (a.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType })); };
+  row(b.up, -1, 'up'); row(b.down, 1, 'down'); col(b.left, -1, 'left'); col(b.right, 1, 'right');
   const m = {}; nodes.forEach((nd) => { m[nd.guid] = nd; });
   const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType })).filter((e) => e.to);
-  return { nodes, edges };
+  const ov = (arr) => Math.max(0, arr.length - CROSS_BAND_CAP);
+  const bands = {
+    up: { key: 'up', label: 'Parents', count: b.up.length, over: ov(b.up), ax: 0, ay: -120, role: 'parent', hidden: !!hidden.up },
+    down: { key: 'down', label: 'Children', count: b.down.length, over: ov(b.down), ax: 0, ay: 120, role: 'child', hidden: !!hidden.down },
+    left: { key: 'left', label: 'Friends', count: b.left.length, over: ov(b.left), ax: -200, ay: 0, role: 'leftFriend', hidden: !!hidden.left },
+    right: { key: 'right', label: 'Opposites · Links', count: b.right.length, over: ov(b.right), ax: 200, ay: 0, role: 'rightFriend', hidden: !!hidden.right },
+  };
+  return { nodes, edges, bands };
 }
 
 /* ───────── view ───────── */
@@ -320,7 +331,7 @@ class BrainView {
     const kept = this._derived.neighbours.filter((n) => f[n.dir === 'in' ? 'in' : (n.kind || 'ref')] !== false);
     const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
     const lay = this._layoutMode === 'tree' ? layoutTree : (this._layoutMode === 'cross' ? layoutCross : layoutPlex);
-    this.graph = lay({ focus: this._derived.focus, neighbours: kept });
+    this.graph = lay({ focus: this._derived.focus, neighbours: kept, hidden: this._gateHidden }); // BP-4: collapsed bands
     for (const n of this.graph.nodes) { const p = prev.get(n.guid); n._fx = p ? p.x : 0; n._fy = p ? p.y : 0; }
     this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
     this._fit(); this.dirty = true; this._updateChrome();
@@ -394,13 +405,14 @@ class BrainView {
     return null;
   }
   _wire() {
-    const cv = this.cv; let mode = null, sx = 0, sy = 0, cx0 = 0, cy0 = 0, downNode = null, moved = false;
+    const cv = this.cv; let mode = null, sx = 0, sy = 0, cx0 = 0, cy0 = 0, downNode = null, downGate = null, moved = false;
     const rel = (e) => { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
-    const onDown = (e) => { cv.focus(); const p = rel(e); moved = false; downNode = this._nodeAt(p.x, p.y); mode = 'down'; sx = e.clientX; sy = e.clientY; cx0 = this.camera.x; cy0 = this.camera.y; try { cv.setPointerCapture(e.pointerId); } catch (_e) {} };
-    const onMove = (e) => { const p = rel(e); if (mode === 'down' || mode === 'pan') { if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) { mode = 'pan'; moved = true; this.camera.x = cx0 - (e.clientX - sx) / this.camera.zoom; this.camera.y = cy0 - (e.clientY - sy) / this.camera.zoom; this.dirty = true; } } const h = this._nodeAt(p.x, p.y); if (h !== this._hover) { this._hover = h; this.dirty = true; cv.style.cursor = h ? 'pointer' : 'grab'; } };
+    const onDown = (e) => { cv.focus(); const p = rel(e); moved = false; downNode = this._nodeAt(p.x, p.y); downGate = downNode ? null : this._gateAt(p.x, p.y); mode = 'down'; sx = e.clientX; sy = e.clientY; cx0 = this.camera.x; cy0 = this.camera.y; try { cv.setPointerCapture(e.pointerId); } catch (_e) {} };
+    const onMove = (e) => { const p = rel(e); if (mode === 'down' || mode === 'pan') { if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) { mode = 'pan'; moved = true; this.camera.x = cx0 - (e.clientX - sx) / this.camera.zoom; this.camera.y = cy0 - (e.clientY - sy) / this.camera.zoom; this.dirty = true; } } const h = this._nodeAt(p.x, p.y); if (h !== this._hover) { this._hover = h; this.dirty = true; cv.style.cursor = (h || this._gateAt(p.x, p.y)) ? 'pointer' : 'grab'; } };
     const onUp = (e) => {
-      if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (downNode.kind === 'virtual') { /* unresolved — not navigable */ } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url opens externally; virtual is inert
-      mode = null; downNode = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
+      if (mode === 'down' && !moved && downGate) { if (!this._gateHidden) this._gateHidden = {}; this._gateHidden[downGate] = !this._gateHidden[downGate]; this._relayout(); } // BP-4: toggle band
+      else if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (downNode.kind === 'virtual') { /* unresolved — not navigable */ } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url opens externally; virtual is inert
+      mode = null; downNode = null; downGate = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
     const onWheel = (e) => { e.preventDefault(); const p = rel(e); this.camera.zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0012)); this.dirty = true; };
     cv.addEventListener('pointerdown', onDown); cv.addEventListener('pointermove', onMove); cv.addEventListener('pointerup', onUp); cv.addEventListener('wheel', onWheel, { passive: false });
@@ -444,7 +456,30 @@ class BrainView {
       ctx.fillStyle = nd.focus ? '#ffffff' : '#e6e8ee'; ctx.font = (nd.focus ? '600 15px' : '13px') + ' system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
       ctx.fillText(this._clip(ctx, nd.title, nd.w - 18), P.x, P.y);
     }
+    // BP-4: directional gate headers (cross layout only) — label · count (+overflow), click to collapse/expand the band.
+    this._gateRects = [];
+    if (this.graph.bands) {
+      ctx.font = '600 12px system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+      for (const g of Object.values(this.graph.bands)) {
+        if (!g.count) continue;
+        const P = { x: g.ax, y: g.ay };
+        const txt = g.label + ' · ' + g.count + (g.over ? ' +' + g.over : '') + (g.hidden ? '  ▸' : '');
+        const tw = ctx.measureText(txt).width, padX = 9, gw = tw + padX * 2, gh = 22;
+        ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(P.x - gw / 2, P.y - gh / 2, gw, gh, 11); else ctx.rect(P.x - gw / 2, P.y - gh / 2, gw, gh);
+        ctx.fillStyle = '#0d1320'; ctx.globalAlpha = g.hidden ? 0.45 : 0.95; ctx.fill(); ctx.globalAlpha = 1;
+        ctx.lineWidth = 1.3 / z; ctx.strokeStyle = relColor(g.role, null); ctx.stroke();
+        ctx.fillStyle = g.hidden ? '#8b93a7' : relColor(g.role, null); ctx.fillText(txt, P.x, P.y);
+        this._gateRects.push({ key: g.key, cx: P.x, cy: P.y, w: gw, h: gh });
+      }
+    }
     ctx.textAlign = 'left';
+  }
+  // BP-4: which gate header (if any) is at a screen point — mirrors _nodeAt (screen → world).
+  _gateAt(sx, sy) {
+    if (!this._gateRects || !this._gateRects.length) return null;
+    const w = this.camera.screenToWorld(sx, sy);
+    for (const g of this._gateRects) { if (Math.abs(w.x - g.cx) <= g.w / 2 && Math.abs(w.y - g.cy) <= g.h / 2) return g.key; }
+    return null;
   }
   destroy() { this.destroyed = true; for (const dz of this._disposers.splice(0)) { try { dz(); } catch (_e) {} } }
 }
