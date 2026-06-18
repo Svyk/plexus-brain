@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.22.0';
+const BRAIN_VERSION = '0.23.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -477,7 +477,7 @@ class BrainView {
       if (mode === 'down' && !moved && downTask) { this._toggleFocusTask(downTask); } // IO-4: complete a focus task in-graph
       else if (mode === 'down' && !moved && downGate) { if (!this._gateHidden) this._gateHidden = {}; this._gateHidden[downGate] = !this._gateHidden[downGate]; this._relayout(); } // BP-4: toggle band
       else if (mode === 'down' && !moved && downNode && e.altKey && !downNode.focus && downNode.kind !== 'url' && downNode.kind !== 'virtual') { this._promoteRelation(downNode.guid); } // BS-4: Alt-click writes a real relation
-      else if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (downNode.kind === 'virtual') { /* unresolved — not navigable */ } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url opens externally; virtual is inert
+      else if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (downNode.kind === 'virtual') { /* unresolved — not navigable */ } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid, downNode.lineItemGuid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url opens externally; virtual is inert; BS-7: open lands on the exact source line
       mode = null; downNode = null; downGate = null; downTask = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
     const onWheel = (e) => { e.preventDefault(); const p = rel(e); this.camera.zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0012)); this.dirty = true; };
@@ -501,11 +501,14 @@ class BrainView {
       this.setFocus(this.focusGuid); // re-derive: the edge is now a DEFINED relation
     } catch (e) { console.error('[Plexus Brain] promoteRelation', e); }
   }
-  async _openRecord(guid) {
+  async _openRecord(guid, lineGuid) {
     const ws = (this.plugin.getWorkspaceGuid && this.plugin.getWorkspaceGuid()) || this.plugin.workspaceGuid;
     let p = null; try { p = await this.plugin.ui.createPanel({ afterPanel: this.panel }); } catch (_e) {}
     if (!p) { try { p = await this.plugin.ui.createPanel(); } catch (_e) {} }
-    if (p) { try { p.navigateTo({ type: 'edit_panel', rootId: guid, workspaceGuid: ws }); } catch (e) { console.error('[Plexus Brain] openRecord', e); } }
+    if (!p) return;
+    // BS-7: if the neighbour came from a specific source LINE, land on that exact line (highlighted), not just the record root.
+    if (lineGuid) { try { const ok = await p.navigateTo({ itemGuid: lineGuid, highlight: true }); if (ok !== false) return; } catch (_e) {} }
+    try { p.navigateTo({ type: 'edit_panel', rootId: guid, workspaceGuid: ws }); } catch (e) { console.error('[Plexus Brain] openRecord', e); }
   }
   _clip(ctx, s, maxW) { s = String(s == null ? '' : s); if (ctx.measureText(s).width <= maxW) return s; while (s.length && ctx.measureText(s + '…').width > maxW) s = s.slice(0, -1); return s + '…'; }
   render() {
