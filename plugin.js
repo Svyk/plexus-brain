@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.13.0';
+const BRAIN_VERSION = '0.14.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -114,54 +114,125 @@ async function deriveNeighbourhood(plugin, guid) {
   const rec = await plugin.data.getRecord(guid);
   if (!rec) return { focus: { guid, title: '(not found)' }, neighbours: [] };
   const focus = { guid, title: (rec.getName && rec.getName()) || 'Untitled' };
-  const seen = new Set([guid]); const neighbours = [];
-  // BP-1: incoming — detailed backrefs carry kind ('line'|'property'), propertyId, lineItemGuid, so we can
-  // distinguish a DEFINED relation (a record-type property pointing here) from an INFERRED one (a line ref).
-  try {
-    const back = await rec.getBackReferences();
-    for (const br of (back || [])) {
-      const r = br && br.record; const g = r && r.guid;
-      if (g && !seen.has(g)) { seen.add(g); neighbours.push({ guid: g, title: (r.getName && r.getName()) || 'Untitled', dir: 'in', bkind: br.kind, propertyId: br.propertyId || null, lineItemGuid: br.lineItemGuid || null }); }
+  const ont = plugin._ontology;
+  const rels = new Map(); // guid -> { guid, title, f:{facets}, kinds:Set, propertyId, lineItemGuid }
+  const specials = [];    // url / unresolved-virtual nodes (non-relational)
+  const seen = new Set([guid]);
+  const touch = (g, title) => { let e = rels.get(g); if (!e) { e = { guid: g, title: title || 'Untitled', f: {}, kinds: new Set(), propertyId: null, lineItemGuid: null }; rels.set(g, e); } else if (title && (!e.title || e.title === 'Untitled')) e.title = title; return e; };
+
+  // INCOMING backrefs (BP-1 detailed): a record-PROPERTY pointing here is a DEFINED relation (bucket INVERTED to
+  // focus's POV); a LINE ref is an INFERRED parent (someone links to focus ⇒ they're a parent in the link model).
+  let back = null;
+  try { back = await rec.getBackReferences(); }
+  catch (_e) { try { back = ((await rec.getBackReferenceRecords()) || []).map((r) => ({ record: r, kind: 'line' })); } catch (_e2) { back = []; } }
+  for (const br of (back || [])) {
+    const r = br && br.record; const g = r && r.guid; if (!g || g === guid) continue;
+    const e = touch(g, (r.getName && r.getName()) || 'Untitled'); e.kinds.add('in');
+    if (br.kind === 'property' && br.propertyId) {
+      e.propertyId = br.propertyId;
+      const fld = resolveBackrefField(plugin, g, br.propertyId);
+      const bucket = fld && fld.bucket;
+      if (bucket === 'parents') e.f.cd = true;        // source "parent: focus" ⇒ neighbour is focus's CHILD
+      else if (bucket === 'children') e.f.pd = true;  // source "child: focus"  ⇒ neighbour is focus's PARENT
+      else if (bucket === 'leftFriends') e.f.lfd = true;
+      else if (bucket === 'rightFriends') e.f.rfd = true;
+      else if (bucket === 'previous') e.f.nfd = true; // source "previous: focus" ⇒ neighbour is focus's NEXT
+      else if (bucket === 'next') e.f.pfd = true;
+      else e.f.pi = true;                             // uncategorized property backref ⇒ inferred parent
+    } else {
+      e.f.pi = true; if (br.lineItemGuid) e.lineItemGuid = br.lineItemGuid;
     }
-  } catch (_e) {
-    // fallback for any build without the detailed API
-    try { const back = await rec.getBackReferenceRecords(); for (const r of (back || [])) { const g = r.guid; if (g && !seen.has(g)) { seen.add(g); neighbours.push({ guid: g, title: (r.getName && r.getName()) || 'Untitled', dir: 'in' }); } } } catch (_e2) {}
   }
-  const addOut = async (g, kind) => {
-    if (!g || seen.has(g)) return; seen.add(g);
-    let title = 'Untitled'; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || title; else { if (kind === 'ref') neighbours.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual' }); return; } } catch (_e) { if (kind === 'ref') neighbours.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual' }); return; } // P9: virtual node for an unresolvable ref
-    neighbours.push({ guid: g, title, dir: 'out', kind: kind || 'ref' });
-  };
-  // outbound — ref segments + hashtag co-occurrence (records sharing a hashtag with the focus)
+
+  // OUTBOUND ref segments (focus body → neighbour): INFERRED child. Unresolvable ref ⇒ a virtual node.
   let items = null; try { items = await rec.getLineItems(); } catch (_e) {}
-  for (const g of refGuidsFromLineItems(items)) await addOut(g, 'ref');
+  for (const g of refGuidsFromLineItems(items)) {
+    if (g === guid) continue;
+    let title = null, resolved = true;
+    try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || null; else resolved = false; } catch (_e) { resolved = false; }
+    if (!resolved) { if (!seen.has(g) && !rels.has(g)) { seen.add(g); specials.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual', role: 'rightFriend', relType: 'INFERRED' }); } continue; }
+    const e = touch(g, title); e.kinds.add('ref'); e.f.ci = true;
+  }
+
+  // OUTBOUND record-PROPERTY relations (focus → neighbour): bucket from the focus FIELD NAME (DEFINED).
+  try {
+    const props = (rec.getAllProperties && rec.getAllProperties()) || [];
+    for (const pr of props) {
+      const bucket = bucketOfFieldLabel(ont, pr && pr.name);
+      let raw = null; try { raw = pr.values && pr.values(); } catch (_e) {}
+      const guids = [];
+      for (const v of (raw || [])) {
+        if (typeof v === 'string') { if (v[0] === '[') { try { for (const g of JSON.parse(v)) if (typeof g === 'string') guids.push(g); } catch (_e) {} } else if (/^[0-9A-Z]{12,}$/.test(v)) guids.push(v); }
+        else if (v && typeof v === 'object' && v.guid) guids.push(v.guid);
+      }
+      for (const g of guids) {
+        if (g === guid) continue;
+        let title = null; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || null; } catch (_e) {}
+        const e = touch(g, title); e.kinds.add('prop');
+        if (bucket === 'parents') e.f.pd = true;
+        else if (bucket === 'children') e.f.cd = true;
+        else if (bucket === 'leftFriends') e.f.lfd = true;
+        else if (bucket === 'rightFriends') e.f.rfd = true;
+        else if (bucket === 'previous') e.f.pfd = true;
+        else if (bucket === 'next') e.f.nfd = true;
+        else e.f.ci = true;                            // uncategorized outbound prop ⇒ inferred child
+      }
+    }
+  } catch (_e) {}
+
+  // HASHTAG co-occurrence (records sharing a hashtag): INFERRED friend.
   try {
     for (const tag of hashtagsFromLineItems(items).slice(0, 4)) {
       try {
         const res = await plugin.data.searchByQuery('#' + tag, 8);
-        for (const r of ((res && res.records) || [])) await addOut(r.guid, 'tag');
-        for (const li of ((res && res.lines) || [])) { let g = null; try { g = li.getRecord && li.getRecord().guid; } catch (_e) {} if (g) await addOut(g, 'tag'); } // tags usually live on LINE items, resolve to their record
+        const tagRecs = [];
+        for (const r of ((res && res.records) || [])) tagRecs.push([r.guid, (r.getName && r.getName()) || null]);
+        for (const li of ((res && res.lines) || [])) { let g = null, t = null; try { const rr = li.getRecord && li.getRecord(); g = rr && rr.guid; t = rr && rr.getName && rr.getName(); } catch (_e) {} if (g) tagRecs.push([g, t]); }
+        for (const [g, t] of tagRecs) { if (!g || g === guid) continue; const e = touch(g, t); e.kinds.add('tag'); e.f.lfi = true; }
       } catch (_e) {}
     }
   } catch (_e) {}
-  // outbound — record-type PROPERTY relations (read raw via PluginProperty.values() + normalize, GUARDRAIL rule 13)
-  try {
-    const props = (rec.getAllProperties && rec.getAllProperties()) || [];
-    for (const pr of props) {
-      let raw = null; try { raw = pr.values && pr.values(); } catch (_e) {}
-      for (const v of (raw || [])) {
-        if (typeof v === 'string') { if (v[0] === '[') { try { for (const g of JSON.parse(v)) if (typeof g === 'string') await addOut(g, 'prop'); } catch (_e) {} } else if (/^[0-9A-Z]{12,}$/.test(v)) await addOut(v, 'prop'); }
-        else if (v && typeof v === 'object' && v.guid) await addOut(v.guid, 'prop');
-      }
-    }
-  } catch (_e) {}
-  // P9: URL nodes — links written in the focus's text become external nodes (click opens them).
-  try { for (const li of (items || [])) { const segs = li.segments || []; for (const s of segs) { const tx = (typeof s.text === 'string') ? s.text : (s.text && (s.text.url || s.text.label)) || ''; for (const u of (String(tx).match(/https?:\/\/[^\s)]+/g) || [])) { if (!seen.has(u)) { seen.add(u); neighbours.push({ guid: u, title: u.replace(/^https?:\/\//, '').slice(0, 28), dir: 'out', kind: 'url', url: u }); } } } } } catch (_e) {}
+
+  // URL nodes (non-relational): external links written in the focus's text.
+  try { for (const li of (items || [])) { const segs = li.segments || []; for (const s of segs) { const tx = (typeof s.text === 'string') ? s.text : (s.text && (s.text.url || s.text.label)) || ''; for (const u of (String(tx).match(/https?:\/\/[^\s)]+/g) || [])) { if (!seen.has(u) && !rels.has(u)) { seen.add(u); specials.push({ guid: u, title: u.replace(/^https?:\/\//, '').slice(0, 28), dir: 'out', kind: 'url', url: u, role: 'rightFriend', relType: 'INFERRED' }); } } } } } catch (_e) {}
+
+  // RESOLVE each accumulated relation to ONE role via the truth-table.
+  const neighbours = [];
+  for (const e of rels.values()) {
+    const rr = resolveRole(e.f); if (!rr) continue;
+    const dir = (rr.role === 'parent') ? 'in' : 'out';
+    neighbours.push({ guid: e.guid, title: e.title, role: rr.role, relType: rr.type, dir, kind: [...e.kinds][0] || 'ref', propertyId: e.propertyId, lineItemGuid: e.lineItemGuid });
+  }
+  for (const sp of specials) neighbours.push(sp);
   return { focus, neighbours };
 }
+// BP-3: truth-table — collapse a neighbour's fat facet bag into ONE mutually-exclusive role (ExcaliBrain cases A–Q).
+// Facets: pi/pd parent-inferred/defined, ci/cd child, lfd/rfd left/right-friend-defined, pfd/nfd prev/next-defined,
+// lfi inferred friend (tag co-occurrence). DEFINED beats INFERRED; ≥2 defined OR mutual inferred parent+child ⇒ friend.
+function definedCount(f) { return [f.pd, f.cd, f.lfd, f.rfd, f.pfd, f.nfd].filter(Boolean).length; }
+function resolveRole(f) {
+  if (!f) return null;
+  if (definedCount(f) >= 2) return { role: 'leftFriend', type: 'DEFINED' }; // over-defined collapses to friend (cases H/I)
+  if (f.pd) return { role: 'parent', type: 'DEFINED' };
+  if (f.cd) return { role: 'child', type: 'DEFINED' };
+  if (f.lfd) return { role: 'leftFriend', type: 'DEFINED' };
+  if (f.rfd) return { role: 'rightFriend', type: 'DEFINED' };
+  if (f.pfd) return { role: 'previous', type: 'DEFINED' };
+  if (f.nfd) return { role: 'next', type: 'DEFINED' };
+  if (f.pi && f.ci) return { role: 'leftFriend', type: 'INFERRED' }; // mutual inferred parent+child ⇒ friends
+  if (f.pi) return { role: 'parent', type: 'INFERRED' };
+  if (f.ci) return { role: 'child', type: 'INFERRED' };
+  if (f.lfi) return { role: 'leftFriend', type: 'INFERRED' };        // tag co-occurrence / inferred friend
+  return null;
+}
+// Per-ROLE colour: parent=blue, child=green, friend=purple, right-friend/next=amber, url=cyan, virtual=grey, sem=pink.
+function relColor(role, kind) {
+  if (kind === 'url') return '#06b6d4'; if (kind === 'virtual') return '#9ca3af'; if (kind === 'sem') return '#ec4899';
+  if (role === 'parent') return '#3b82f6'; if (role === 'child') return '#10b981';
+  if (role === 'rightFriend' || role === 'next') return '#f59e0b';
+  return '#7c5cff'; // leftFriend / previous / fallback
+}
 // Radial layout: focus at (0,0), neighbours on rings around it.
-// Per-relation colour: incoming=blue, ref=purple, property=green, hashtag=amber.
-function relColor(dir, kind) { if (dir === 'in') return '#3b82f6'; if (kind === 'prop') return '#10b981'; if (kind === 'tag') return '#f59e0b'; if (kind === 'sem') return '#ec4899'; if (kind === 'url') return '#06b6d4'; if (kind === 'virtual') return '#9ca3af'; return '#7c5cff'; }
 function layoutPlex(graph) {
   const nodes = []; const NW = 168, NH = 44;
   nodes.push({ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true });
@@ -170,34 +241,34 @@ function layoutPlex(graph) {
   for (const nb of graph.neighbours) {
     const ring = Math.floor(i / perRing), idxInRing = i % perRing, countInRing = Math.min(perRing, n - ring * perRing);
     const R = R0 + ring * 200, a = (idxInRing / countInRing) * Math.PI * 2 - Math.PI / 2;
-    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind });
+    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType });
     i++;
   }
-  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind }));
+  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType }));
   return { nodes, edges };
 }
 // Phase 7: alternate layout — focus on top, neighbours in a grid below (hierarchical/tree feel).
 function layoutTree(graph) {
   const NW = 180, NH = 44, cols = 4, gx = 206, gy = 66;
   const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
-  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind }); });
-  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind }));
+  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); });
+  const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType }));
   return { nodes, edges };
 }
-// P8: structured cross layout — parents (backrefs) above, children (refs/props) below, friends (tag/sem) to the
-// sides. Roles come from dir/kind, mapped to Thymer's typed channels (ExcaliBrain parity).
+// BP-3/P8: structured cross layout — parents UP, children DOWN, left-friends/previous LEFT, right-friends/next RIGHT.
+// Roles come from the truth-table (nb.role), not dir/kind guesses.
 function layoutCross(graph) {
   const NW = 172, NH = 44;
   const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
-  const role = (nb) => nb.dir === 'in' ? 'up' : (nb.kind === 'tag' ? 'right' : (nb.kind === 'sem' ? 'left' : 'down'));
+  const band = (nb) => { const r = nb.role; if (r === 'parent') return 'up'; if (r === 'child') return 'down'; if (r === 'rightFriend' || r === 'next') return 'right'; if (r === 'leftFriend' || r === 'previous') return 'left'; if (nb.kind === 'url' || nb.kind === 'virtual') return 'right'; return 'left'; };
   const b = { up: [], down: [], left: [], right: [] };
-  for (const nb of graph.neighbours) b[role(nb)].push(nb);
+  for (const nb of graph.neighbours) b[band(nb)].push(nb);
   const HSTEP = NW + 26, VSTEP = NH + 18, COLS = 6;
-  const row = (arr, ySign) => arr.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, arr.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind }); });
-  const col = (arr, xSign) => arr.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (arr.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind }));
+  const row = (arr, ySign) => arr.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, arr.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }); });
+  const col = (arr, xSign) => arr.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (arr.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType }));
   row(b.up, -1); row(b.down, 1); col(b.left, -1); col(b.right, 1);
   const m = {}; nodes.forEach((nd) => { m[nd.guid] = nd; });
-  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind })).filter((e) => e.to);
+  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType })).filter((e) => e.to);
   return { nodes, edges };
 }
 
@@ -353,12 +424,15 @@ class BrainView {
     // edges
     for (const ed of this.graph.edges) {
       const f = pos(ed.from), tn = pos(ed.to);
-      ctx.strokeStyle = relColor(ed.dir, ed.kind); ctx.globalAlpha = 0.55 * e; ctx.lineWidth = 1.5 / z;
+      const inf = ed.relType === 'INFERRED'; // BP-3/BP-4: inferred relations render dashed + dimmer than defined ones
+      ctx.strokeStyle = relColor(ed.role, ed.kind); ctx.globalAlpha = (inf ? 0.32 : 0.6) * e; ctx.lineWidth = 1.5 / z;
+      ctx.setLineDash(inf ? [5 / z, 4 / z] : []);
       ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.quadraticCurveTo((f.x + tn.x) / 2, (f.y + tn.y) / 2, tn.x, tn.y); ctx.stroke();
+      ctx.setLineDash([]);
       // P8: arrowhead encodes direction — 'in' (parent) points AT the focus, others point AWAY to the neighbour.
       const hx = ed.dir === 'in' ? f.x : tn.x, hy = ed.dir === 'in' ? f.y : tn.y, ox = ed.dir === 'in' ? tn.x : f.x, oy = ed.dir === 'in' ? tn.y : f.y;
       const ang = Math.atan2(hy - oy, hx - ox), aw = 9 / z;
-      ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(hx - aw * Math.cos(ang - 0.4), hy - aw * Math.sin(ang - 0.4)); ctx.lineTo(hx - aw * Math.cos(ang + 0.4), hy - aw * Math.sin(ang + 0.4)); ctx.closePath(); ctx.fillStyle = relColor(ed.dir, ed.kind); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(hx - aw * Math.cos(ang - 0.4), hy - aw * Math.sin(ang - 0.4)); ctx.lineTo(hx - aw * Math.cos(ang + 0.4), hy - aw * Math.sin(ang + 0.4)); ctx.closePath(); ctx.fillStyle = relColor(ed.role, ed.kind); ctx.fill();
     }
     ctx.globalAlpha = 1;
     // nodes
@@ -366,7 +440,7 @@ class BrainView {
       const P = pos(nd); const x = P.x - nd.w / 2, y = P.y - nd.h / 2; const rad = 9;
       ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, nd.w, nd.h, rad); else ctx.rect(x, y, nd.w, nd.h);
       ctx.fillStyle = nd.focus ? '#7c5cff' : '#1b2030'; ctx.fill();
-      ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = nd.focus ? '#a78bfa' : relColor(nd.dir, nd.kind); ctx.stroke();
+      ctx.lineWidth = (nd === this._hover ? 2.5 : 1.5) / z; ctx.strokeStyle = nd.focus ? '#a78bfa' : relColor(nd.role, nd.kind); ctx.stroke();
       ctx.fillStyle = nd.focus ? '#ffffff' : '#e6e8ee'; ctx.font = (nd.focus ? '600 15px' : '13px') + ' system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
       ctx.fillText(this._clip(ctx, nd.title, nd.w - 18), P.x, P.y);
     }
