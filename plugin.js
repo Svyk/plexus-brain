@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.24.0';
+const BRAIN_VERSION = '0.25.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -478,13 +478,25 @@ class BrainView {
     const cv = this.cv; let mode = null, sx = 0, sy = 0, cx0 = 0, cy0 = 0, downNode = null, downGate = null, downTask = null, moved = false;
     const rel = (e) => { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
     const onDown = (e) => { cv.focus(); const p = rel(e); moved = false; downNode = this._nodeAt(p.x, p.y); downTask = downNode ? null : this._taskAt(p.x, p.y); downGate = (downNode || downTask) ? null : this._gateAt(p.x, p.y); mode = 'down'; sx = e.clientX; sy = e.clientY; cx0 = this.camera.x; cy0 = this.camera.y; try { cv.setPointerCapture(e.pointerId); } catch (_e) {} };
-    const onMove = (e) => { const p = rel(e); if (mode === 'down' || mode === 'pan') { if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) { mode = 'pan'; moved = true; this.camera.x = cx0 - (e.clientX - sx) / this.camera.zoom; this.camera.y = cy0 - (e.clientY - sy) / this.camera.zoom; this.dirty = true; } } const h = this._nodeAt(p.x, p.y); if (h !== this._hover) { this._hover = h; this.dirty = true; cv.style.cursor = (h || this._gateAt(p.x, p.y) || this._taskAt(p.x, p.y)) ? 'pointer' : 'grab'; } };
+    const onMove = (e) => {
+      const p = rel(e);
+      if ((mode === 'down' || mode === 'pan' || mode === 'dragnode') && Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) {
+        moved = true;
+        // BS-5: dragging a NODE (not focus/url/virtual) onto a gate restructures it; dragging empty space pans.
+        if (mode !== 'pan' && downNode && !downNode.focus && downNode.kind !== 'url' && downNode.kind !== 'virtual') {
+          mode = 'dragnode'; const w = this.camera.screenToWorld(p.x, p.y); this._drag = { guid: downNode.guid, title: downNode.title, x: w.x, y: w.y, gate: this._gateAt(p.x, p.y) }; cv.style.cursor = 'grabbing'; this.dirty = true; return;
+        }
+        mode = 'pan'; this.camera.x = cx0 - (e.clientX - sx) / this.camera.zoom; this.camera.y = cy0 - (e.clientY - sy) / this.camera.zoom; this.dirty = true; return;
+      }
+      const h = this._nodeAt(p.x, p.y); if (h !== this._hover) { this._hover = h; this.dirty = true; cv.style.cursor = (h || this._gateAt(p.x, p.y) || this._taskAt(p.x, p.y)) ? 'pointer' : 'grab'; }
+    };
     const onUp = (e) => {
       if (mode === 'down' && !moved && downTask) { this._toggleFocusTask(downTask); } // IO-4: complete a focus task in-graph
       else if (mode === 'down' && !moved && downGate) { if (!this._gateHidden) this._gateHidden = {}; this._gateHidden[downGate] = !this._gateHidden[downGate]; this._relayout(); } // BP-4: toggle band
       else if (mode === 'down' && !moved && downNode && e.altKey && !downNode.focus && downNode.kind !== 'url' && downNode.kind !== 'virtual') { this._promoteRelation(downNode.guid); } // BS-4: Alt-click writes a real relation
       else if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (downNode.kind === 'virtual') { /* unresolved — not navigable */ } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid, downNode.lineItemGuid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url opens externally; virtual is inert; BS-7: open lands on the exact source line
-      mode = null; downNode = null; downGate = null; downTask = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
+      else if (mode === 'dragnode' && this._drag) { const g = this._gateAt(rel(e).x, rel(e).y) || this._drag.gate; if (g) this._restructure(this._drag.guid, g); } // BS-5: dropped on a gate → write the relation
+      this._drag = null; mode = null; downNode = null; downGate = null; downTask = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
     const onWheel = (e) => { e.preventDefault(); const p = rel(e); this.camera.zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0012)); this.dirty = true; };
     const onKey = (e) => {
@@ -506,6 +518,20 @@ class BrainView {
       try { this.plugin.ui.addToaster({ title: 'Linked as a real relation — re-deriving.', dismissible: true }); } catch (_e) {}
       this.setFocus(this.focusGuid); // re-derive: the edge is now a DEFINED relation
     } catch (e) { console.error('[Plexus Brain] promoteRelation', e); }
+  }
+  // BS-5: drag-to-restructure — a node dropped on a gate writes the matching relation property on the FOCUS
+  // (up=parent, down=child, left/right/sib=friend) → the graph as a control surface. ExcaliBrain can't write typed props.
+  async _restructure(targetGuid, gateKey) {
+    if (!this.focusGuid || !targetGuid || targetGuid === this.focusGuid) return;
+    const cand = gateKey === 'up' ? ['Parent', 'Parents', 'Source', 'Up'] : gateKey === 'down' ? ['Child', 'Children', 'Down', 'Subtasks'] : ['Related', 'Friends', 'Links', 'See Also'];
+    try {
+      const rec = await this.plugin.data.getRecord(this.focusGuid); if (!rec || !rec.prop) return;
+      let p = null; for (const k of cand) { const pp = rec.prop(k); if (pp) { p = pp; break; } }
+      if (!p) { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: focus has no ' + cand[0] + '-type relation property to write.', dismissible: true }); } catch (_e) {} return; }
+      if (p.addValue) p.addValue(targetGuid); else if (p.set) p.set(targetGuid);
+      try { this.plugin.ui.addToaster({ title: 'Restructured — wrote the ' + gateKey + ' relation. Re-deriving.', dismissible: true }); } catch (_e) {}
+      this.setFocus(this.focusGuid);
+    } catch (e) { console.error('[Plexus Brain] restructure', e); }
   }
   async _openRecord(guid, lineGuid) {
     const ws = (this.plugin.getWorkspaceGuid && this.plugin.getWorkspaceGuid()) || this.plugin.workspaceGuid;
@@ -548,6 +574,10 @@ class BrainView {
       }
     }
     ctx.globalAlpha = 1;
+    // BS-5: drag-to-restructure feedback — dashed line from the focus to the cursor; the target gate glows.
+    if (this._drag) {
+      const fn = this.graph.nodes[0]; if (fn) { const fp = pos(fn); ctx.strokeStyle = this._drag.gate ? '#22c55e' : '#7c5cff'; ctx.globalAlpha = 0.8; ctx.lineWidth = 2 / z; ctx.setLineDash([6 / z, 4 / z]); ctx.beginPath(); ctx.moveTo(fp.x, fp.y); ctx.lineTo(this._drag.x, this._drag.y); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1; }
+    }
     // nodes
     for (const nd of this.graph.nodes) {
       const sk = nd.skin || {}; const sc = nd.focus ? 1 : (sk.scale || 1); // BS-2: Priority scales the node
