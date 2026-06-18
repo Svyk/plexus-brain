@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.23.0';
+const BRAIN_VERSION = '0.24.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -293,7 +293,7 @@ function layoutPlex(graph) {
   for (const nb of graph.neighbours) {
     const ring = Math.floor(i / perRing), idxInRing = i % perRing, countInRing = Math.min(perRing, n - ring * perRing);
     const R = R0 + ring * 200, a = (idxInRing / countInRing) * Math.PI * 2 - Math.PI / 2;
-    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection });
+    nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew });
     i++;
   }
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType, label: nd.label }));
@@ -303,7 +303,7 @@ function layoutPlex(graph) {
 function layoutTree(graph) {
   const NW = 180, NH = 44, cols = 4, gx = 206, gy = 66;
   const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
-  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection }); });
+  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew }); });
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType, label: nd.label }));
   return { nodes, edges };
 }
@@ -320,13 +320,13 @@ function layoutCross(graph) {
   for (const nb of graph.neighbours) b[crossBand(nb)].push(nb);
   const HSTEP = NW + 26, VSTEP = NH + 18, COLS = 6;
   const cap = (arr) => arr.length > CROSS_BAND_CAP ? arr.slice(0, CROSS_BAND_CAP) : arr;
-  const row = (arr, ySign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, a.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection }); }); };
-  const col = (arr, xSign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (a.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection })); };
+  const row = (arr, ySign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / COLS), cc = Math.min(COLS, a.length - r * COLS), ci = i % COLS; nodes.push({ guid: nb.guid, title: nb.title, x: (ci - (cc - 1) / 2) * HSTEP, y: ySign * (190 + r * (NH + 22)), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew }); }); };
+  const col = (arr, xSign, key) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => nodes.push({ guid: nb.guid, title: nb.title, x: xSign * (250 + NW / 2), y: (i - (a.length - 1) / 2) * VSTEP, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew })); };
   // BP-5: siblings cluster in the UPPER-RIGHT (ExcaliBrain convention), in its own compact grid.
-  const grid = (arr, key, x0, y0, cols) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / cols), ci = i % cols; nodes.push({ guid: nb.guid, title: nb.title, x: x0 + ci * (NW + 14), y: y0 + r * (NH + 14), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection }); }); };
+  const grid = (arr, key, x0, y0, cols) => { if (hidden[key]) return; const a = cap(arr); a.forEach((nb, i) => { const r = Math.floor(i / cols), ci = i % cols; nodes.push({ guid: nb.guid, title: nb.title, x: x0 + ci * (NW + 14), y: y0 + r * (NH + 14), w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew }); }); };
   row(b.up, -1, 'up'); row(b.down, 1, 'down'); col(b.left, -1, 'left'); col(b.right, 1, 'right'); grid(b.sib, 'sib', 300, -330, 3);
   const m = {}; nodes.forEach((nd) => { m[nd.guid] = nd; });
-  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection })).filter((e) => e.to);
+  const edges = graph.neighbours.map((nb) => ({ from: nodes[0], to: m[nb.guid], dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew })).filter((e) => e.to);
   const ov = (arr) => Math.max(0, arr.length - CROSS_BAND_CAP);
   const bands = {
     up: { key: 'up', label: 'Parents', count: b.up.length, over: ov(b.up), ax: 0, ay: -120, role: 'parent', hidden: !!hidden.up },
@@ -381,8 +381,14 @@ class BrainView {
       this._saveHistory();
     }
     try { await this.plugin._ensureIndex(); } catch (_e) {} // BP-2: field index ready before derive (recColMap fills in async)
+    // BS-8: graph diff — when RE-deriving the same focus (e.g. after a record.updated), flag neighbours that are NEW
+    // since the last derive so the renderer can glow them green.
+    const sameFocus = this._lastDerivedFocus === guid;
+    const prevSet = sameFocus && this._derived ? new Set(this._derived.neighbours.map((n) => n.guid)) : null;
     this._derived = await deriveNeighbourhood(this.plugin, guid);
     if (this.destroyed) return;
+    if (prevSet) for (const n of this._derived.neighbours) n.isNew = !prevSet.has(n.guid);
+    this._lastDerivedFocus = guid;
     this._relayout();
   }
   // Phase 5: filter the derived neighbours by kind, re-layout with a FLIP tween (no re-derive).
@@ -546,6 +552,7 @@ class BrainView {
     for (const nd of this.graph.nodes) {
       const sk = nd.skin || {}; const sc = nd.focus ? 1 : (sk.scale || 1); // BS-2: Priority scales the node
       const w = nd.w * sc, h = nd.h * sc; const P = pos(nd); const x = P.x - w / 2, y = P.y - h / 2; const rad = 9;
+      if (nd.isNew && !nd.focus) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x - 5, y - 5, w + 10, h + 10, rad + 4); else ctx.rect(x - 5, y - 5, w + 10, h + 10); ctx.lineWidth = 2.5 / z; ctx.strokeStyle = '#22c55e'; ctx.globalAlpha = 0.9; ctx.stroke(); ctx.globalAlpha = 1; } // BS-8: new-since-last-derive glow
       if (sk.urgent && !nd.focus) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x - 4, y - 4, w + 8, h + 8, rad + 3); else ctx.rect(x - 4, y - 4, w + 8, h + 8); ctx.lineWidth = 2.5 / z; ctx.strokeStyle = '#ef4444'; ctx.globalAlpha = 0.85; ctx.stroke(); ctx.globalAlpha = 1; } // Due-past urgency ring
       ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, rad); else ctx.rect(x, y, w, h);
       ctx.fillStyle = nd.focus ? '#7c5cff' : '#1b2030'; ctx.fill();
