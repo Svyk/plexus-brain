@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.12.0';
+const BRAIN_VERSION = '0.13.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -17,6 +17,16 @@ const PLEXUS_ONTOLOGY_DEFAULT = {
   journalCollection: 'Journal', drawingsCollection: 'Plexus Drawings', iconsCollection: 'Icons',
   templatesCollection: 'Templates', capturesCollection: 'Captures',
   relationTags: { captured: 'captured', project: 'project', icon: 'icon' },
+  // BP-2/BP-3: which record-property field NAMES map a DEFINED relation to an ExcaliBrain category.
+  // Matched case-insensitively against the field label. A name claimed by an earlier bucket wins (priority order).
+  relationBuckets: {
+    parents: ['parent', 'parents', 'up', 'source', 'origin', 'part of', 'belongs to'],
+    children: ['child', 'children', 'down', 'subtask', 'subtasks', 'contains'],
+    leftFriends: ['friend', 'friends', 'related', 'similar', 'supports', 'see also', 'attendees', 'people'],
+    rightFriends: ['opposes', 'blocks', 'blocked by', 'conflicts with'],
+    previous: ['previous', 'prev', 'after'],
+    next: ['next', 'before', 'leads to'],
+  },
 };
 function loadPlexusOntology() {
   try { if (typeof window !== 'undefined' && window.__plexusOntology) return window.__plexusOntology; } catch (_e) {}
@@ -42,6 +52,54 @@ function refGuidsFromLineItems(items) {
     for (const s of segs) { if (s && s.type === 'ref' && s.text && s.text.guid) out.push(s.text.guid); }
   }
   return out;
+}
+// BP-2: field-resolution index — the Dataview replacement. Maps a field LABEL to a relation bucket (priority order:
+// a name claimed by an earlier bucket wins), builds a per-collection field schema, and a recordGuid→collection map.
+function bucketOfFieldLabel(ontology, label) {
+  if (!label) return null;
+  const L = String(label).trim().toLowerCase();
+  const rb = (ontology && ontology.relationBuckets) || {};
+  for (const bucket of ['parents', 'children', 'leftFriends', 'rightFriends', 'previous', 'next']) {
+    if ((rb[bucket] || []).some((n) => String(n).toLowerCase() === L)) return bucket;
+  }
+  return null;
+}
+async function buildFieldIndex(plugin) {
+  const idx = { byGuid: {}, byName: {} };
+  let cols = null; try { cols = await plugin.data.getAllCollections(); } catch (_e) { return idx; }
+  for (const c of (cols || [])) {
+    let guid = null, name = null, cfg = null;
+    try { guid = c.getGuid && c.getGuid(); } catch (_e) {}
+    try { name = c.getName && c.getName(); } catch (_e) {}
+    try { cfg = c.getConfiguration && c.getConfiguration(); } catch (_e) {}
+    const fields = {};
+    const fl = (cfg && (cfg.fields || cfg.field_definitions)) || [];
+    for (const f of fl) {
+      const fid = f.id || f.field_id || f.guid; if (!fid) continue;
+      const label = f.label || f.name || fid;
+      fields[fid] = { label, type: f.type, isRelation: f.type === 'record' || f.type === 'relation', bucket: bucketOfFieldLabel(plugin._ontology, label) };
+    }
+    const entry = { guid, name, fields, col: c };
+    if (guid) idx.byGuid[guid] = entry;
+    if (name) idx.byName[name] = entry;
+  }
+  return idx;
+}
+async function buildRecordCollectionMap(plugin, fieldIndex) {
+  // recordGuid -> colGuid. O(all records) ONCE on graph open; cached. Never called on the per-frame render thread.
+  const map = {};
+  for (const e of Object.values((fieldIndex && fieldIndex.byGuid) || {})) {
+    let recs = null; try { recs = await e.col.getAllRecords(); } catch (_e) { continue; }
+    for (const r of (recs || [])) { if (r && r.guid) map[r.guid] = e.guid; }
+  }
+  return map;
+}
+// Resolve a backref's (sourceRecordGuid, propertyId) → { label, isRelation, bucket } using the indexes.
+function resolveBackrefField(plugin, sourceGuid, propertyId) {
+  if (!propertyId || !plugin._fieldIndex || !plugin._recColMap) return null;
+  const colGuid = plugin._recColMap[sourceGuid]; if (!colGuid) return null;
+  const col = plugin._fieldIndex.byGuid[colGuid]; if (!col) return null;
+  return col.fields[propertyId] || null;
 }
 function hashtagsFromLineItems(items) {
   const out = new Set();
@@ -179,6 +237,7 @@ class BrainView {
   async setFocus(guid, nav) {
     this.focusGuid = guid;
     if (!nav) { this._history = this._history.slice(0, this._hi + 1); if (this._history[this._hi] !== guid) { this._history.push(guid); this._hi = this._history.length - 1; } }
+    try { await this.plugin._ensureIndex(); } catch (_e) {} // BP-2: field index ready before derive (recColMap fills in async)
     this._derived = await deriveNeighbourhood(this.plugin, guid);
     if (this.destroyed) return;
     this._relayout();
@@ -339,6 +398,14 @@ class Plugin extends AppPlugin {
   _teardown() { cancelAnimationFrame(this._raf); for (const v of this._views) { try { v.destroy(); } catch (_e) {} } this._views.clear(); window.__plexusBrain = undefined; }
   onUnload() { this._teardown(); }
   _activeRecord() { try { const p = this.ui.getActivePanel(); const r = p && p.getActiveRecord && p.getActiveRecord(); return (r && r.guid) || this._lastRecordGuid; } catch (_e) { return this._lastRecordGuid; } }
+  // BP-2: build the field-resolution index once. Field schema (cheap) is awaited; the expensive recordGuid→collection
+  // map builds in the BACKGROUND so the graph never blocks — DEFINED-relation enrichment lights up when it's ready.
+  async _ensureIndex() {
+    if (this._indexBuilt) return;
+    this._indexBuilt = true;
+    try { this._fieldIndex = await buildFieldIndex(this); } catch (_e) { this._fieldIndex = { byGuid: {}, byName: {} }; }
+    buildRecordCollectionMap(this, this._fieldIndex).then((m) => { this._recColMap = m; }).catch(() => { this._recColMap = {}; });
+  }
   // Phase 6: local embedder (transformers.js, in-browser) — powers the semantic lens.
   _getEmbedder() {
     if (this._embedderP) return this._embedderP;
