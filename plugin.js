@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.15.0';
+const BRAIN_VERSION = '0.16.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -146,6 +146,9 @@ async function deriveNeighbourhood(plugin, guid) {
 
   // OUTBOUND ref segments (focus body → neighbour): INFERRED child. Unresolvable ref ⇒ a virtual node.
   let items = null; try { items = await rec.getLineItems(); } catch (_e) {}
+  // IO-4/BS-3: the focus's OWN open tasks (real task line items) → a togglable rail. Cheap (items already fetched).
+  focus.tasks = [];
+  for (const li of (items || [])) { let st = null; try { st = li.getTaskStatus && li.getTaskStatus(); } catch (_e) {} if (st != null && st !== 'done') { focus.tasks.push({ guid: li.guid, text: lineTextOf(li) || '(task)', li }); if (focus.tasks.length >= 6) break; } }
   for (const g of refGuidsFromLineItems(items)) {
     if (g === guid) continue;
     let title = null, resolved = true;
@@ -405,14 +408,15 @@ class BrainView {
     return null;
   }
   _wire() {
-    const cv = this.cv; let mode = null, sx = 0, sy = 0, cx0 = 0, cy0 = 0, downNode = null, downGate = null, moved = false;
+    const cv = this.cv; let mode = null, sx = 0, sy = 0, cx0 = 0, cy0 = 0, downNode = null, downGate = null, downTask = null, moved = false;
     const rel = (e) => { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
-    const onDown = (e) => { cv.focus(); const p = rel(e); moved = false; downNode = this._nodeAt(p.x, p.y); downGate = downNode ? null : this._gateAt(p.x, p.y); mode = 'down'; sx = e.clientX; sy = e.clientY; cx0 = this.camera.x; cy0 = this.camera.y; try { cv.setPointerCapture(e.pointerId); } catch (_e) {} };
-    const onMove = (e) => { const p = rel(e); if (mode === 'down' || mode === 'pan') { if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) { mode = 'pan'; moved = true; this.camera.x = cx0 - (e.clientX - sx) / this.camera.zoom; this.camera.y = cy0 - (e.clientY - sy) / this.camera.zoom; this.dirty = true; } } const h = this._nodeAt(p.x, p.y); if (h !== this._hover) { this._hover = h; this.dirty = true; cv.style.cursor = (h || this._gateAt(p.x, p.y)) ? 'pointer' : 'grab'; } };
+    const onDown = (e) => { cv.focus(); const p = rel(e); moved = false; downNode = this._nodeAt(p.x, p.y); downTask = downNode ? null : this._taskAt(p.x, p.y); downGate = (downNode || downTask) ? null : this._gateAt(p.x, p.y); mode = 'down'; sx = e.clientX; sy = e.clientY; cx0 = this.camera.x; cy0 = this.camera.y; try { cv.setPointerCapture(e.pointerId); } catch (_e) {} };
+    const onMove = (e) => { const p = rel(e); if (mode === 'down' || mode === 'pan') { if (Math.abs(e.clientX - sx) + Math.abs(e.clientY - sy) > 3) { mode = 'pan'; moved = true; this.camera.x = cx0 - (e.clientX - sx) / this.camera.zoom; this.camera.y = cy0 - (e.clientY - sy) / this.camera.zoom; this.dirty = true; } } const h = this._nodeAt(p.x, p.y); if (h !== this._hover) { this._hover = h; this.dirty = true; cv.style.cursor = (h || this._gateAt(p.x, p.y) || this._taskAt(p.x, p.y)) ? 'pointer' : 'grab'; } };
     const onUp = (e) => {
-      if (mode === 'down' && !moved && downGate) { if (!this._gateHidden) this._gateHidden = {}; this._gateHidden[downGate] = !this._gateHidden[downGate]; this._relayout(); } // BP-4: toggle band
+      if (mode === 'down' && !moved && downTask) { this._toggleFocusTask(downTask); } // IO-4: complete a focus task in-graph
+      else if (mode === 'down' && !moved && downGate) { if (!this._gateHidden) this._gateHidden = {}; this._gateHidden[downGate] = !this._gateHidden[downGate]; this._relayout(); } // BP-4: toggle band
       else if (mode === 'down' && !moved && downNode) { if (downNode.kind === 'url') { try { window.open(downNode.guid, '_blank'); } catch (_e) {} } else if (downNode.kind === 'virtual') { /* unresolved — not navigable */ } else if (e.shiftKey || e.metaKey || e.ctrlKey) this._openRecord(downNode.guid); else if (!downNode.focus) this.setFocus(downNode.guid); } // P9: url opens externally; virtual is inert
-      mode = null; downNode = null; downGate = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
+      mode = null; downNode = null; downGate = null; downTask = null; try { cv.releasePointerCapture(e.pointerId); } catch (_e) {}
     };
     const onWheel = (e) => { e.preventDefault(); const p = rel(e); this.camera.zoomAt(p.x, p.y, Math.exp(-e.deltaY * 0.0012)); this.dirty = true; };
     cv.addEventListener('pointerdown', onDown); cv.addEventListener('pointermove', onMove); cv.addEventListener('pointerup', onUp); cv.addEventListener('wheel', onWheel, { passive: false });
@@ -472,6 +476,24 @@ class BrainView {
         this._gateRects.push({ key: g.key, cx: P.x, cy: P.y, w: gw, h: gh });
       }
     }
+    // IO-4: focus open-tasks rail — real togglable task line items, stacked just below the focus node.
+    this._taskRects = [];
+    const ftasks = (this._derived && this._derived.focus && this._derived.focus.tasks) || [];
+    if (ftasks.length) {
+      ctx.font = '12px system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      const RW = 250, RH = 24, x0 = -RW / 2, y0 = 48, show = Math.min(ftasks.length, 3);
+      for (let i = 0; i < show; i++) {
+        const t = ftasks[i], ry = y0 + i * (RH + 4);
+        ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x0, ry, RW, RH, 6); else ctx.rect(x0, ry, RW, RH);
+        ctx.fillStyle = '#141a28'; ctx.globalAlpha = 0.96; ctx.fill(); ctx.globalAlpha = 1;
+        ctx.lineWidth = 1 / z; ctx.strokeStyle = '#2a3344'; ctx.stroke();
+        const cbx = x0 + 7, cby = ry + (RH - 14) / 2;
+        ctx.lineWidth = 1.4 / z; ctx.strokeStyle = '#f59e0b'; ctx.strokeRect(cbx, cby, 14, 14);
+        ctx.fillStyle = '#cdd3df'; ctx.fillText(this._clip(ctx, t.text, RW - 34), cbx + 22, ry + RH / 2);
+        this._taskRects.push({ guid: t.guid, cx: x0 + RW / 2, cy: ry + RH / 2, w: RW, h: RH, cbx, cby, li: t.li });
+      }
+      if (ftasks.length > show) { ctx.fillStyle = '#8b93a7'; ctx.fillText('+' + (ftasks.length - show) + ' more open', x0 + 8, y0 + show * (RH + 4) + 8); }
+    }
     ctx.textAlign = 'left';
   }
   // BP-4: which gate header (if any) is at a screen point — mirrors _nodeAt (screen → world).
@@ -480,6 +502,19 @@ class BrainView {
     const w = this.camera.screenToWorld(sx, sy);
     for (const g of this._gateRects) { if (Math.abs(w.x - g.cx) <= g.w / 2 && Math.abs(w.y - g.cy) <= g.h / 2) return g.key; }
     return null;
+  }
+  // IO-4: which task-rail checkbox (if any) is at a screen point. Returns the rail entry so onUp can toggle it.
+  _taskAt(sx, sy) {
+    if (!this._taskRects || !this._taskRects.length) return null;
+    const w = this.camera.screenToWorld(sx, sy);
+    for (const t of this._taskRects) { if (Math.abs(w.x - t.cx) <= t.w / 2 && Math.abs(w.y - t.cy) <= t.h / 2) return t; }
+    return null;
+  }
+  async _toggleFocusTask(t) {
+    if (!t || !t.li) return;
+    try { await t.li.setTaskStatus('done'); } catch (e) { console.error('[Plexus Brain] setTaskStatus', e); return; }
+    if (this._derived && this._derived.focus && this._derived.focus.tasks) this._derived.focus.tasks = this._derived.focus.tasks.filter((x) => x.guid !== t.guid);
+    this.dirty = true;
   }
   destroy() { this.destroyed = true; for (const dz of this._disposers.splice(0)) { try { dz(); } catch (_e) {} } }
 }
