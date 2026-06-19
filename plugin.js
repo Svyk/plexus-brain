@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.26.0';
+const BRAIN_VERSION = '0.27.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -86,11 +86,15 @@ async function buildFieldIndex(plugin) {
   return idx;
 }
 async function buildRecordCollectionMap(plugin, fieldIndex) {
-  // recordGuid -> colGuid. O(all records) ONCE on graph open; cached. Never called on the per-frame render thread.
-  const map = {};
+  // recordGuid -> colGuid. Built ONCE on graph open, in the BACKGROUND (never the per-frame thread). BOUNDED by a
+  // record budget so a huge workspace can't OOM / freeze on open — past the cap, nodes simply render without a
+  // collection colour (cosmetic). Yields between collections so it never blocks input.
+  const map = {}; let count = 0; const CAP = 60000;
   for (const e of Object.values((fieldIndex && fieldIndex.byGuid) || {})) {
+    if (count >= CAP) break;
     let recs = null; try { recs = await e.col.getAllRecords(); } catch (_e) { continue; }
-    for (const r of (recs || [])) { if (r && r.guid) map[r.guid] = e.guid; }
+    for (const r of (recs || [])) { if (r && r.guid) { map[r.guid] = e.guid; if (++count >= CAP) break; } }
+    await Promise.resolve(); // yield to the event loop between collections
   }
   return map;
 }
@@ -154,17 +158,18 @@ async function deriveNeighbourhood(plugin, guid) {
   // IO-4/BS-3: the focus's OWN open tasks (real task line items) → a togglable rail. Cheap (items already fetched).
   focus.tasks = [];
   for (const li of (items || [])) { let st = null; try { st = li.getTaskStatus && li.getTaskStatus(); } catch (_e) {} if (st != null && st !== 'done') { focus.tasks.push({ guid: li.guid, text: lineTextOf(li) || '(task)', li }); if (focus.tasks.length >= 6) break; } }
-  for (const g of refGuidsFromLineItems(items)) {
-    if (g === guid) continue;
-    let title = null, resolved = true, trec = null;
-    try { trec = await plugin.data.getRecord(g); if (trec) title = (trec.getName && trec.getName()) || null; else resolved = false; } catch (_e) { resolved = false; }
-    if (!resolved) { if (!seen.has(g) && !rels.has(g)) { seen.add(g); specials.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual', role: 'rightFriend', relType: 'INFERRED' }); } continue; }
-    const e = touch(g, title); e.kinds.add('ref'); e.f.ci = true; e.rec = e.rec || trec;
-  }
+  const outRefGuids = refGuidsFromLineItems(items).filter((g) => g !== guid);
+  const outRefRecs = await Promise.all(outRefGuids.map((g) => plugin.data.getRecord(g).catch(() => null))); // PARALLEL (was serial N+1)
+  outRefGuids.forEach((g, i) => {
+    const trec = outRefRecs[i];
+    if (!trec) { if (!seen.has(g) && !rels.has(g)) { seen.add(g); specials.push({ guid: g, title: '(unresolved)', dir: 'out', kind: 'virtual', role: 'rightFriend', relType: 'INFERRED' }); } return; }
+    const e = touch(g, (trec.getName && trec.getName()) || null); e.kinds.add('ref'); e.f.ci = true; e.rec = e.rec || trec;
+  });
 
   // OUTBOUND record-PROPERTY relations (focus → neighbour): bucket from the focus FIELD NAME (DEFINED).
   try {
     const props = (rec.getAllProperties && rec.getAllProperties()) || [];
+    const propTargets = []; // {g, bucket, name} — collect across all props, then fetch the records in ONE parallel batch
     for (const pr of props) {
       const bucket = bucketOfFieldLabel(ont, pr && pr.name);
       let raw = null; try { raw = pr.values && pr.values(); } catch (_e) {}
@@ -173,32 +178,33 @@ async function deriveNeighbourhood(plugin, guid) {
         if (typeof v === 'string') { if (v[0] === '[') { try { for (const g of JSON.parse(v)) if (typeof g === 'string') guids.push(g); } catch (_e) {} } else if (/^[0-9A-Z]{12,}$/.test(v)) guids.push(v); }
         else if (v && typeof v === 'object' && v.guid) guids.push(v.guid);
       }
-      for (const g of guids) {
-        if (g === guid) continue;
-        let title = null, trec = null; try { trec = await plugin.data.getRecord(g); if (trec) title = (trec.getName && trec.getName()) || null; } catch (_e) {}
-        const e = touch(g, title); e.kinds.add('prop'); e.rec = e.rec || trec;
-        if (bucket && pr && pr.name) e.label = e.label || pr.name; // BS-1: edge label = the relation field name
-        if (bucket === 'parents') e.f.pd = true;
-        else if (bucket === 'children') e.f.cd = true;
-        else if (bucket === 'leftFriends') e.f.lfd = true;
-        else if (bucket === 'rightFriends') e.f.rfd = true;
-        else if (bucket === 'previous') e.f.pfd = true;
-        else if (bucket === 'next') e.f.nfd = true;
-        else e.f.ci = true;                            // uncategorized outbound prop ⇒ inferred child
-      }
+      for (const g of guids) { if (g !== guid) propTargets.push({ g, bucket, name: pr && pr.name }); }
     }
+    const propRecs = await Promise.all(propTargets.map((t) => plugin.data.getRecord(t.g).catch(() => null))); // PARALLEL (was serial N+1)
+    propTargets.forEach((t, i) => {
+      const trec = propRecs[i], title = (trec && trec.getName && trec.getName()) || null;
+      const e = touch(t.g, title); e.kinds.add('prop'); e.rec = e.rec || trec;
+      if (t.bucket && t.name) e.label = e.label || t.name; // BS-1: edge label = the relation field name
+      if (t.bucket === 'parents') e.f.pd = true;
+      else if (t.bucket === 'children') e.f.cd = true;
+      else if (t.bucket === 'leftFriends') e.f.lfd = true;
+      else if (t.bucket === 'rightFriends') e.f.rfd = true;
+      else if (t.bucket === 'previous') e.f.pfd = true;
+      else if (t.bucket === 'next') e.f.nfd = true;
+      else e.f.ci = true;                            // uncategorized outbound prop ⇒ inferred child
+    });
   } catch (_e) {}
 
   // HASHTAG co-occurrence (records sharing a hashtag): INFERRED friend.
   try {
-    for (const tag of hashtagsFromLineItems(items).slice(0, 4)) {
-      try {
-        const res = await plugin.data.searchByQuery('#' + tag, 8);
-        const tagRecs = [];
-        for (const r of ((res && res.records) || [])) tagRecs.push([r.guid, (r.getName && r.getName()) || null]);
-        for (const li of ((res && res.lines) || [])) { let g = null, t = null; try { const rr = li.getRecord && li.getRecord(); g = rr && rr.guid; t = rr && rr.getName && rr.getName(); } catch (_e) {} if (g) tagRecs.push([g, t]); }
-        for (const [g, t] of tagRecs) { if (!g || g === guid) continue; const e = touch(g, t); e.kinds.add('tag'); e.f.lfi = true; }
-      } catch (_e) {}
+    const tags = hashtagsFromLineItems(items).slice(0, 4);
+    const tagResults = await Promise.all(tags.map((tag) => plugin.data.searchByQuery('#' + tag, 8).catch(() => null))); // PARALLEL (was 4 serial searches; debounce guards rate limits)
+    for (const res of tagResults) {
+      if (!res) continue;
+      const tagRecs = [];
+      for (const r of ((res.records) || [])) tagRecs.push([r.guid, (r.getName && r.getName()) || null]);
+      for (const li of ((res.lines) || [])) { let g = null, t = null; try { const rr = li.getRecord && li.getRecord(); g = rr && rr.guid; t = rr && rr.getName && rr.getName(); } catch (_e) {} if (g) tagRecs.push([g, t]); }
+      for (const [g, t] of tagRecs) { if (!g || g === guid) continue; const e = touch(g, t); e.kinds.add('tag'); e.f.lfi = true; }
     }
   } catch (_e) {}
 
@@ -219,32 +225,38 @@ async function deriveNeighbourhood(plugin, guid) {
   const parents = neighbours.filter((n) => n.role === 'parent').slice(0, 4);
   if (parents.length) {
     const known = new Set([guid, ...neighbours.map((n) => n.guid)]);
+    const parentRecs = await Promise.all(parents.map((p) => plugin.data.getRecord(p.guid).catch(() => null))); // PARALLEL parent fetch
+    const parentItems = await Promise.all(parentRecs.map((pr) => (pr && pr.getLineItems) ? pr.getLineItems().catch(() => null) : Promise.resolve(null)));
     const sibGuids = [];
-    for (const p of parents) {
-      if (sibGuids.length >= 12) break;
-      try {
-        const pr = await plugin.data.getRecord(p.guid); if (!pr) continue;
-        const pitems = await pr.getLineItems();
-        const childGuids = new Set(refGuidsFromLineItems(pitems)); // parent's inferred children (its outbound refs)
-        const pprops = (pr.getAllProperties && pr.getAllProperties()) || [];
-        for (const prop of pprops) {
-          if (bucketOfFieldLabel(ont, prop && prop.name) !== 'children') continue;
-          let raw = null; try { raw = prop.values && prop.values(); } catch (_e) {}
-          for (const v of (raw || [])) {
-            if (typeof v === 'string') { if (v[0] === '[') { try { for (const g of JSON.parse(v)) if (typeof g === 'string') childGuids.add(g); } catch (_e) {} } else if (/^[0-9A-Z]{12,}$/.test(v)) childGuids.add(v); }
-            else if (v && typeof v === 'object' && v.guid) childGuids.add(v.guid);
-          }
+    for (let pi = 0; pi < parents.length && sibGuids.length < 12; pi++) {
+      const pr = parentRecs[pi]; if (!pr) continue;
+      const childGuids = new Set(refGuidsFromLineItems(parentItems[pi])); // parent's inferred children (its outbound refs)
+      const pprops = (pr.getAllProperties && pr.getAllProperties()) || [];
+      for (const prop of pprops) {
+        if (bucketOfFieldLabel(ont, prop && prop.name) !== 'children') continue;
+        let raw = null; try { raw = prop.values && prop.values(); } catch (_e) {}
+        for (const v of (raw || [])) {
+          if (typeof v === 'string') { if (v[0] === '[') { try { for (const g of JSON.parse(v)) if (typeof g === 'string') childGuids.add(g); } catch (_e) {} } else if (/^[0-9A-Z]{12,}$/.test(v)) childGuids.add(v); }
+          else if (v && typeof v === 'object' && v.guid) childGuids.add(v.guid);
         }
-        for (const g of childGuids) { if (g && !known.has(g)) { known.add(g); sibGuids.push(g); if (sibGuids.length >= 12) break; } }
-      } catch (_e) {}
+      }
+      for (const g of childGuids) { if (g && !known.has(g)) { known.add(g); sibGuids.push(g); if (sibGuids.length >= 12) break; } }
     }
-    for (const g of sibGuids) {
-      let title = null; try { const t = await plugin.data.getRecord(g); if (t) title = (t.getName && t.getName()) || null; } catch (_e) {}
-      neighbours.push({ guid: g, title: title || 'Untitled', role: 'sibling', relType: 'INFERRED', dir: 'out', kind: 'sibling' });
-    }
+    const sibRecs = await Promise.all(sibGuids.map((g) => plugin.data.getRecord(g).catch(() => null))); // PARALLEL sib title fetch
+    sibGuids.forEach((g, i) => { const t = sibRecs[i]; const title = (t && t.getName && t.getName()) || null; neighbours.push({ guid: g, title: title || 'Untitled', role: 'sibling', relType: 'INFERRED', dir: 'out', kind: 'sibling' }); });
   }
   return { focus, neighbours };
 }
+// LRU cache of derived neighbourhoods, keyed by focus guid — re-focusing a recently-viewed node is INSTANT (no
+// re-derive). onChange invalidates the affected entries so it never serves stale data.
+async function cachedDerive(plugin, guid, force) {
+  const cache = plugin._deriveCache || (plugin._deriveCache = new Map());
+  if (!force && cache.has(guid)) { const d = cache.get(guid); cache.delete(guid); cache.set(guid, d); return d; } // LRU touch
+  const d = await deriveNeighbourhood(plugin, guid);
+  cache.set(guid, d); while (cache.size > 16) cache.delete(cache.keys().next().value);
+  return d;
+}
+function invalidateDerive(plugin, guid) { try { if (plugin._deriveCache && guid) plugin._deriveCache.delete(guid); } catch (_e) {} }
 // BP-3: truth-table — collapse a neighbour's fat facet bag into ONE mutually-exclusive role (ExcaliBrain cases A–Q).
 // Facets: pi/pd parent-inferred/defined, ci/cd child, lfd/rfd left/right-friend-defined, pfd/nfd prev/next-defined,
 // lfi inferred friend (tag co-occurrence). DEFINED beats INFERRED; ≥2 defined OR mutual inferred parent+child ⇒ friend.
@@ -284,13 +296,15 @@ function relColor(role, kind) {
   if (role === 'rightFriend' || role === 'next') return '#f59e0b';
   return '#7c5cff'; // leftFriend / previous / fallback
 }
+const MAX_LAYOUT_NODES = 64; // BP-5: cap radial/tree placement (like layoutCross's per-band cap) — keeps a hub node's graph readable + the render loop fast.
 // Radial layout: focus at (0,0), neighbours on rings around it.
 function layoutPlex(graph) {
   const nodes = []; const NW = 168, NH = 44;
   nodes.push({ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true });
-  const n = graph.neighbours.length; if (!n) return { nodes, edges: [] };
+  const neigh = graph.neighbours.length > MAX_LAYOUT_NODES ? graph.neighbours.slice(0, MAX_LAYOUT_NODES) : graph.neighbours;
+  const n = neigh.length; if (!n) return { nodes, edges: [] };
   const perRing = 12, R0 = 260; let i = 0;
-  for (const nb of graph.neighbours) {
+  for (const nb of neigh) {
     const ring = Math.floor(i / perRing), idxInRing = i % perRing, countInRing = Math.min(perRing, n - ring * perRing);
     const R = R0 + ring * 200, a = (idxInRing / countInRing) * Math.PI * 2 - Math.PI / 2;
     nodes.push({ guid: nb.guid, title: nb.title, x: Math.cos(a) * R, y: Math.sin(a) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew });
@@ -303,7 +317,8 @@ function layoutPlex(graph) {
 function layoutTree(graph) {
   const NW = 180, NH = 44, cols = 4, gx = 206, gy = 66;
   const nodes = [{ guid: graph.focus.guid, title: graph.focus.title, x: 0, y: 0, w: NW + 24, h: NH + 8, focus: true }];
-  graph.neighbours.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew }); });
+  const neigh = graph.neighbours.length > MAX_LAYOUT_NODES ? graph.neighbours.slice(0, MAX_LAYOUT_NODES) : graph.neighbours;
+  neigh.forEach((nb, i) => { const c = i % cols, r = Math.floor(i / cols); nodes.push({ guid: nb.guid, title: nb.title, x: (c - (cols - 1) / 2) * gx, y: 100 + r * gy, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, isNew: nb.isNew }); });
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType, label: nd.label }));
   return { nodes, edges };
 }
@@ -371,7 +386,7 @@ class BrainView {
     this.cv.width = Math.round(w * this.dpr); this.cv.height = Math.round(cvh * this.dpr); this.cv.style.width = w + 'px'; this.cv.style.height = cvh + 'px';
     this.cssW = w; this.cssH = cvh;
   }
-  async setFocus(guid, nav) {
+  async setFocus(guid, nav, force) {
     this.focusGuid = guid;
     if (!nav) {
       this._history = this._history.slice(0, this._hi + 1);
@@ -383,13 +398,24 @@ class BrainView {
     try { await this.plugin._ensureIndex(); } catch (_e) {} // BP-2: field index ready before derive (recColMap fills in async)
     // BS-8: graph diff — when RE-deriving the same focus (e.g. after a record.updated), flag neighbours that are NEW
     // since the last derive so the renderer can glow them green.
+    const token = (this._focusToken = (this._focusToken || 0) + 1); // in-flight guard: a newer setFocus supersedes a slow derive
     const sameFocus = this._lastDerivedFocus === guid;
     const prevSet = sameFocus && this._derived ? new Set(this._derived.neighbours.map((n) => n.guid)) : null;
-    this._derived = await deriveNeighbourhood(this.plugin, guid);
-    if (this.destroyed) return;
+    const derived = await cachedDerive(this.plugin, guid, force); // cached re-focus is instant; force=true re-derives (onChange)
+    if (this.destroyed || token !== this._focusToken) return; // a newer focus started — drop this stale result
+    this._derived = derived;
     if (prevSet) for (const n of this._derived.neighbours) n.isNew = !prevSet.has(n.guid);
+    else for (const n of this._derived.neighbours) n.isNew = false; // clear stale diff flags on a cached / different-focus derive
     this._lastDerivedFocus = guid;
     this._relayout();
+  }
+  // Trailing-edge debounce for EVENT-driven re-focus (record/lineitem changes, external navigation) so an edit storm
+  // or rapid navigation coalesces into ONE derive. User clicks call setFocus directly (immediate).
+  _scheduleReFocus(guid, opts) {
+    opts = opts || {};
+    this._pend = { guid, nav: opts.nav, force: opts.force || (this._pend && this._pend.force) };
+    if (this._refocusT) clearTimeout(this._refocusT);
+    this._refocusT = setTimeout(() => { this._refocusT = null; const p = this._pend; this._pend = null; if (p && p.guid && !this.destroyed) this.setFocus(p.guid, p.nav, p.force); }, 180);
   }
   // Phase 5: filter the derived neighbours by kind, re-layout with a FLIP tween (no re-derive).
   _relayout() {
@@ -650,7 +676,7 @@ class BrainView {
     if (this._derived && this._derived.focus && this._derived.focus.tasks) this._derived.focus.tasks = this._derived.focus.tasks.filter((x) => x.guid !== t.guid);
     this.dirty = true;
   }
-  destroy() { this.destroyed = true; for (const dz of this._disposers.splice(0)) { try { dz(); } catch (_e) {} } }
+  destroy() { this.destroyed = true; if (this._refocusT) clearTimeout(this._refocusT); for (const dz of this._disposers.splice(0)) { try { dz(); } catch (_e) {} } }
 }
 
 /* ───────── plugin ───────── */
@@ -668,9 +694,10 @@ class Plugin extends AppPlugin {
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Edit ontology (relation field names)', icon: 'ti-list-tree', onSelected: () => this._editOntology() }); // BP-7
     // BS-10: cross-plugin live companion — when you navigate to a record elsewhere, an OPEN Brain panel refocuses
     // to it (unless that view is pinned). Makes the Brain track Canvas/editor focus automatically.
-    const track = (e) => { try { const r = e.panel && e.panel.getActiveRecord && e.panel.getActiveRecord(); if (r && r.guid) { this._lastRecordGuid = r.guid; for (const v of this._views) { if (!v._pinned && v.focusGuid && v.focusGuid !== r.guid) v.setFocus(r.guid); } } } catch (_e) {} };
+    const track = (e) => { try { const r = e.panel && e.panel.getActiveRecord && e.panel.getActiveRecord(); if (r && r.guid) { this._lastRecordGuid = r.guid; for (const v of this._views) { if (!v._pinned && v.focusGuid && v.focusGuid !== r.guid) v._scheduleReFocus(r.guid, { nav: false }); } } } catch (_e) {} }; // debounced (rapid nav coalesces)
     try { this.events.on('panel.focused', track); this.events.on('panel.navigated', track); } catch (_e) {}
-    const onChange = (e) => { const g = e && e.recordGuid; for (const v of this._views) { if (!g || v.focusGuid === g || v.graph.nodes.some((n) => n.guid === g)) v.setFocus(v.focusGuid); } };
+    // Re-derive on data change — DEBOUNCED + cache-invalidated, so an edit storm doesn't fire dozens of derives.
+    const onChange = (e) => { const g = e && e.recordGuid; if (g) invalidateDerive(this, g); for (const v of this._views) { if (!g || v.focusGuid === g || v.graph.nodes.some((n) => n.guid === g)) { invalidateDerive(this, v.focusGuid); v._scheduleReFocus(v.focusGuid, { nav: true, force: true }); } } };
     try { for (const ev of ['record.updated', 'lineitem.updated', 'lineitem.created', 'lineitem.deleted']) this.events.on(ev, onChange); } catch (_e) {}
     const tick = () => { for (const v of this._views) { if (!v.host || !v.host.isConnected) { v.destroy(); this._views.delete(v); continue; } if (v.dirty) { try { v.render(); } catch (e) { console.error('[Plexus Brain] render', e); } v.dirty = false; } } this._raf = requestAnimationFrame(tick); };
     this._raf = requestAnimationFrame(tick);
@@ -704,7 +731,8 @@ class Plugin extends AppPlugin {
       try { localStorage.setItem('plexus_ontology', JSON.stringify(override)); } catch (_e) {}
       try { window.__plexusOntology = override; } catch (_e) {}
       this._ontology = override; this._indexBuilt = false; // rebuild the field index with the new buckets
-      for (const v of this._views) v.setFocus(v.focusGuid);
+      try { this._deriveCache && this._deriveCache.clear(); } catch (_e) {} // ontology change invalidates every cached derive
+      for (const v of this._views) v.setFocus(v.focusGuid, true, true);
       ov.remove();
       try { this.ui.addToaster({ title: 'Ontology saved. Reload Canvas/Templater to share the change.', dismissible: true }); } catch (_e) {}
     });
