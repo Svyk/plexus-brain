@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.27.0';
+const BRAIN_VERSION = '0.27.1';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -251,10 +251,14 @@ async function deriveNeighbourhood(plugin, guid) {
 // re-derive). onChange invalidates the affected entries so it never serves stale data.
 async function cachedDerive(plugin, guid, force) {
   const cache = plugin._deriveCache || (plugin._deriveCache = new Map());
-  if (!force && cache.has(guid)) { const d = cache.get(guid); cache.delete(guid); cache.set(guid, d); return d; } // LRU touch
+  // Hand out a PRIVATE shallow copy — the view mutates its derive (isNew flags, _addSemantic pushes 'sem' nodes,
+  // _toggleFocusTask filters focus.tasks); writing through to the shared cached object would corrupt the cache and
+  // leak state across views/re-focuses. Clone the mutated surfaces (neighbour objects + the tasks array).
+  const clone = (d) => ({ focus: { ...d.focus, tasks: (d.focus.tasks || []).slice() }, neighbours: d.neighbours.map((n) => ({ ...n })), _semDone: false });
+  if (!force && cache.has(guid)) { const d = cache.get(guid); cache.delete(guid); cache.set(guid, d); return clone(d); } // LRU touch + private copy
   const d = await deriveNeighbourhood(plugin, guid);
   cache.set(guid, d); while (cache.size > 16) cache.delete(cache.keys().next().value);
-  return d;
+  return clone(d);
 }
 function invalidateDerive(plugin, guid) { try { if (plugin._deriveCache && guid) plugin._deriveCache.delete(guid); } catch (_e) {} }
 // BP-3: truth-table — collapse a neighbour's fat facet bag into ONE mutually-exclusive role (ExcaliBrain cases A–Q).
@@ -413,7 +417,10 @@ class BrainView {
   // or rapid navigation coalesces into ONE derive. User clicks call setFocus directly (immediate).
   _scheduleReFocus(guid, opts) {
     opts = opts || {};
-    this._pend = { guid, nav: opts.nav, force: opts.force || (this._pend && this._pend.force) };
+    // A DIFFERENT target already queued (e.g. a navigation) must not be silently dropped by coalescing → fire it now.
+    if (this._pend && this._pend.guid !== guid) { const p = this._pend; this._pend = null; if (this._refocusT) { clearTimeout(this._refocusT); this._refocusT = null; } if (!this.destroyed) this.setFocus(p.guid, p.nav, p.force); }
+    const prevForce = (this._pend && this._pend.guid === guid && this._pend.force) || false;
+    this._pend = { guid, nav: opts.nav, force: opts.force || prevForce };
     if (this._refocusT) clearTimeout(this._refocusT);
     this._refocusT = setTimeout(() => { this._refocusT = null; const p = this._pend; this._pend = null; if (p && p.guid && !this.destroyed) this.setFocus(p.guid, p.nav, p.force); }, 180);
   }
