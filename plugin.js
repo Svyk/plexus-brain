@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.30.0';
+const BRAIN_VERSION = '0.31.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -661,6 +661,17 @@ class BrainView {
     section('🫥 Orphans (unreferenced)', b.orphans, true);
     ov.appendChild(box); this.wrap.appendChild(ov);
   }
+  // SUBGRAPH→CANVAS: send the current focus + visible neighbourhood to an open Plexus Canvas as live bound record cards
+  // + role-coloured arrows (the canvas pulls each card's title/content live). Completes the Canvas↔Brain round-trip.
+  _subgraphToCanvas() {
+    const C = (typeof window !== 'undefined') && window.__plexusCanvas;
+    if (!C || typeof C.dropSubgraph !== 'function') { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: open a Plexus Canvas drawing first, then re-run.', dismissible: true }); } catch (_e) {} return; }
+    if (!this.graph || !this.graph.nodes || !this.graph.nodes.length) { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: focus a note first.', dismissible: true }); } catch (_e) {} return; }
+    const nodes = this.graph.nodes.map((n) => ({ guid: n.guid, title: n.title, role: n.focus ? 'focus' : n.role, x: n.x, y: n.y }));
+    const edges = (this.graph.edges || []).map((e) => ({ from: e.from && e.from.guid, to: e.to && e.to.guid, role: e.role, label: e.label })).filter((e) => e.from && e.to);
+    let ok = false; try { ok = C.dropSubgraph({ focus: { guid: this.focusGuid }, nodes, edges }); } catch (_e) {}
+    try { this.plugin.ui.addToaster({ title: ok ? ('Sent ' + nodes.length + ' card(s) to Plexus Canvas.') : 'Plexus Brain: could not reach a Plexus Canvas (open one).', dismissible: true }); } catch (_e) {}
+  }
   _fit() {
     const nodes = this.graph.nodes; if (!nodes.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -870,6 +881,7 @@ class Plugin extends AppPlugin {
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Edit ontology (relation field names)', icon: 'ti-list-tree', onSelected: () => this._editOntology() }); // BP-7
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Find shortest path to a record…', icon: 'ti-graph', onSelected: () => { const v = this._brainView(); if (v) v._findPath(); else { this._open(this._lastRecordGuid); try { this.ui.addToaster({ title: 'Plexus Brain: graph opened — re-run “Find shortest path”.', dismissible: true }); } catch (_e) {} } } }); // PATH-FINDER
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Analyze graph health (hubs / orphans)', icon: 'ti-chart-bar', onSelected: () => { const v = this._brainView(); if (v) v._analyzeGraph(); else { this._open(this._lastRecordGuid); try { this.ui.addToaster({ title: 'Plexus Brain: graph opened — re-run “Analyze graph health”.', dismissible: true }); } catch (_e) {} } } }); // GRAPH-ANALYTICS
+    this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Send this subgraph to Plexus Canvas', icon: 'ti-graph', onSelected: () => { const v = this._brainView(); if (v) v._subgraphToCanvas(); else { try { this.ui.addToaster({ title: 'Plexus Brain: focus the graph first.', dismissible: true }); } catch (_e) {} } } }); // SUBGRAPH→CANVAS
     // BS-10: cross-plugin live companion — when you navigate to a record elsewhere, an OPEN Brain panel refocuses
     // to it (unless that view is pinned). Makes the Brain track Canvas/editor focus automatically.
     const track = (e) => { try { const r = e.panel && e.panel.getActiveRecord && e.panel.getActiveRecord(); if (r && r.guid) { this._lastRecordGuid = r.guid; for (const v of this._views) { if (!v._pinned && v.focusGuid && v.focusGuid !== r.guid) v._scheduleReFocus(r.guid, { nav: false }); } } } catch (_e) {} }; // debounced (rapid nav coalesces)
