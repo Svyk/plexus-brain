@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.29.0';
+const BRAIN_VERSION = '0.30.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -362,6 +362,12 @@ function layoutRings(focus, neighbours, edges) {
   for (const e of edges) { const f = byGuid.get(e.from), t = byGuid.get(e.to); if (f && t) eds.push({ from: f, to: t, dir: e.dir, kind: e.kind, role: e.role, relType: e.relType, label: e.label, dim: !!(f.dim || t.dim) }); }
   return { nodes, edges: eds };
 }
+// GRAPH-ANALYTICS: bucket records by connection degree (incoming backref count) → Hubs (most-referenced), Leaves
+// (referenced once), Orphans (unreferenced). Pure + node-tested; the workspace scan lives in _analyzeGraph.
+function pxcBucketDegrees(items, topN) {
+  const sorted = items.slice().sort((a, b) => b.degree - a.degree || (a.title || '').localeCompare(b.title || ''));
+  return { hubs: sorted.filter((x) => x.degree > 0).slice(0, topN || 12), leaves: items.filter((x) => x.degree === 1), orphans: items.filter((x) => x.degree === 0), total: items.length };
+}
 // BP-3/P8: which of the 4 cross-layout bands a neighbour belongs to (top-level so the view can filter/hit-test gates).
 function crossBand(nb) { const r = nb.role; if (r === 'parent') return 'up'; if (r === 'child') return 'down'; if (r === 'sibling') return 'sib'; if (r === 'rightFriend' || r === 'next') return 'right'; if (r === 'leftFriend' || r === 'previous') return 'left'; if (nb.kind === 'url' || nb.kind === 'virtual') return 'right'; return 'left'; }
 const CROSS_BAND_CAP = 30; // BP-5: per-band node cap; overflow surfaces as a "+k" badge on the gate.
@@ -620,6 +626,41 @@ class BrainView {
     this._fit(); this.dirty = true; if (this.emptyEl) this.emptyEl.style.display = 'none';
     try { this.plugin.ui.addToaster({ title: 'Path: ' + steps.length + ' node(s), ' + (steps.length - 1) + ' hop(s) — click any node to refocus.', dismissible: true }); } catch (_e) {}
   }
+  // GRAPH-ANALYTICS: one-shot workspace scan — backref-degree per record (bounded + batched off the render thread),
+  // bucketed into Hubs / Leaves / Orphans. Cached 60s; each result row clicks through to focus that record.
+  async _analyzeGraph() {
+    if (this._analytics && (Date.now() - this._analytics.t < 60000)) { this._showAnalytics(this._analytics); return; }
+    try { this.plugin.ui.addToaster({ title: 'Plexus Brain: analysing the graph…', dismissible: true }); } catch (_e) {}
+    let cols = []; try { cols = await this.plugin.data.getAllCollections(); } catch (_e) {}
+    const recs = []; const CAP = 600;
+    for (const col of (cols || [])) { let rs = []; try { rs = await col.getAllRecords(); } catch (_e) {} for (const r of rs) { recs.push(r); if (recs.length >= CAP) break; } if (recs.length >= CAP) break; }
+    const items = [];
+    for (let i = 0; i < recs.length; i += 25) {
+      if (this.destroyed) return;
+      const degs = await Promise.all(recs.slice(i, i + 25).map(async (r) => { let inc = 0; try { const br = await r.getBackReferences(); inc = new Set((br || []).map((x) => x && x.record && x.record.guid).filter((g) => g && g !== r.guid)).size; } catch (_e) {} return { guid: r.guid, title: (r.getName && r.getName()) || 'Untitled', degree: inc }; })); // DISTINCT incoming referrers, exclude self (matches deriveNeighbourhood line 137)
+      for (const d of degs) items.push(d);
+    }
+    const buckets = pxcBucketDegrees(items, 12); buckets.t = Date.now(); buckets.scanned = recs.length; buckets.capped = recs.length >= CAP;
+    this._analytics = buckets; this._showAnalytics(buckets);
+  }
+  _showAnalytics(b) {
+    try { const old = this.wrap.querySelector('.pb-analytics-ov'); if (old) old.remove(); } catch (_e) {} // no stacked overlays on re-run
+    const ov = document.createElement('div'); ov.className = 'pb-analytics-ov'; ov.style.cssText = 'position:absolute;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45)';
+    const box = document.createElement('div'); box.style.cssText = 'background:#1b2030;border:1px solid #333a4a;border-radius:10px;padding:14px;width:420px;max-width:92%;max-height:80%;overflow-y:auto;box-shadow:0 10px 30px rgba(0,0,0,.45)';
+    const done = () => { try { ov.remove(); } catch (_e) {} };
+    ov.addEventListener('pointerdown', (e) => { if (e.target === ov) { e.stopPropagation(); done(); } });
+    box.addEventListener('pointerdown', (e) => e.stopPropagation()); box.addEventListener('wheel', (e) => e.stopPropagation());
+    const head = document.createElement('div'); head.textContent = 'Graph health · ' + b.scanned + (b.capped ? '+ ' : ' ') + 'records'; head.style.cssText = 'color:#e6e8ee;font:600 14px system-ui;margin-bottom:10px'; box.appendChild(head);
+    const section = (title, rows, sub) => {
+      const h = document.createElement('div'); h.textContent = title + '  (' + rows.length + ')'; h.style.cssText = 'color:#a78bfa;font:600 12px system-ui;margin:10px 0 4px'; box.appendChild(h);
+      if (!rows.length) { const e = document.createElement('div'); e.textContent = '— none —'; e.style.cssText = 'color:#8b93a7;font:12px system-ui;padding:2px 0'; box.appendChild(e); return; }
+      rows.slice(0, 30).forEach((r) => { const row = document.createElement('div'); row.textContent = (sub ? '' : (r.degree + '× ')) + r.title; row.title = r.title; row.style.cssText = 'padding:5px 8px;border-radius:6px;cursor:pointer;color:#e6e8ee;font:13px system-ui;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'; row.addEventListener('mouseenter', () => { row.style.background = 'rgba(124,92,255,.22)'; }); row.addEventListener('mouseleave', () => { row.style.background = ''; }); row.addEventListener('mousedown', (e) => { e.preventDefault(); done(); this.setFocus(r.guid); }); box.appendChild(row); });
+    };
+    section('🔗 Hubs (most-referenced)', b.hubs);
+    section('🍃 Leaves (referenced once)', b.leaves);
+    section('🫥 Orphans (unreferenced)', b.orphans, true);
+    ov.appendChild(box); this.wrap.appendChild(ov);
+  }
   _fit() {
     const nodes = this.graph.nodes; if (!nodes.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -828,12 +869,13 @@ class Plugin extends AppPlugin {
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Focus current note', icon: 'ti-graph', onSelected: () => { const r = this._activeRecord(); this._open(r); } });
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Edit ontology (relation field names)', icon: 'ti-list-tree', onSelected: () => this._editOntology() }); // BP-7
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Find shortest path to a record…', icon: 'ti-graph', onSelected: () => { const v = this._brainView(); if (v) v._findPath(); else { this._open(this._lastRecordGuid); try { this.ui.addToaster({ title: 'Plexus Brain: graph opened — re-run “Find shortest path”.', dismissible: true }); } catch (_e) {} } } }); // PATH-FINDER
+    this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Analyze graph health (hubs / orphans)', icon: 'ti-chart-bar', onSelected: () => { const v = this._brainView(); if (v) v._analyzeGraph(); else { this._open(this._lastRecordGuid); try { this.ui.addToaster({ title: 'Plexus Brain: graph opened — re-run “Analyze graph health”.', dismissible: true }); } catch (_e) {} } } }); // GRAPH-ANALYTICS
     // BS-10: cross-plugin live companion — when you navigate to a record elsewhere, an OPEN Brain panel refocuses
     // to it (unless that view is pinned). Makes the Brain track Canvas/editor focus automatically.
     const track = (e) => { try { const r = e.panel && e.panel.getActiveRecord && e.panel.getActiveRecord(); if (r && r.guid) { this._lastRecordGuid = r.guid; for (const v of this._views) { if (!v._pinned && v.focusGuid && v.focusGuid !== r.guid) v._scheduleReFocus(r.guid, { nav: false }); } } } catch (_e) {} }; // debounced (rapid nav coalesces)
     try { this.events.on('panel.focused', track); this.events.on('panel.navigated', track); } catch (_e) {}
     // Re-derive on data change — DEBOUNCED + cache-invalidated, so an edit storm doesn't fire dozens of derives.
-    const onChange = (e) => { const g = e && e.recordGuid; if (g) invalidateDerive(this, g); for (const v of this._views) { if (!g || v.focusGuid === g || v.graph.nodes.some((n) => n.guid === g)) { invalidateDerive(this, v.focusGuid); v._scheduleReFocus(v.focusGuid, { nav: true, force: true }); } } };
+    const onChange = (e) => { const g = e && e.recordGuid; if (g) invalidateDerive(this, g); for (const v of this._views) { v._analytics = null; if (!g || v.focusGuid === g || v.graph.nodes.some((n) => n.guid === g)) { invalidateDerive(this, v.focusGuid); v._scheduleReFocus(v.focusGuid, { nav: true, force: true }); } } }; // GRAPH-ANALYTICS: any change invalidates the cached degree scan
     try { for (const ev of ['record.updated', 'lineitem.updated', 'lineitem.created', 'lineitem.deleted']) this.events.on(ev, onChange); } catch (_e) {}
     const tick = () => { for (const v of this._views) { if (!v.host || !v.host.isConnected) { v.destroy(); this._views.delete(v); continue; } if (v.dirty) { try { v.render(); } catch (e) { console.error('[Plexus Brain] render', e); } v.dirty = false; } } this._raf = requestAnimationFrame(tick); };
     this._raf = requestAnimationFrame(tick);
