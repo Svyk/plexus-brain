@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.27.1';
+const BRAIN_VERSION = '0.28.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -326,6 +326,27 @@ function layoutTree(graph) {
   const edges = nodes.slice(1).map((nd) => ({ from: nodes[0], to: nd, dir: nd.dir, kind: nd.kind, role: nd.role, relType: nd.relType, label: nd.label }));
   return { nodes, edges };
 }
+// PATH-FINDER: shortest path between two records over the typed-relation graph. Pure BFS (level-order = shortest) over a
+// static adjacency map → guid path or null. The live version in _findPath uses async cachedDerive for adjacency. Tested.
+function pxcBfsPath(adjMap, start, target, maxHops) {
+  if (start === target) return [start];
+  const prev = new Map([[start, null]]); let frontier = [start], hops = 0; const cap = maxHops || 8;
+  while (frontier.length && hops < cap) {
+    const next = [];
+    for (const g of frontier) { for (const nb of (adjMap[g] || [])) { if (prev.has(nb)) continue; prev.set(nb, g); if (nb === target) { const path = []; let c = nb; while (c != null) { path.unshift(c); c = prev.get(c); } return path; } next.push(nb); } }
+    frontier = next; hops++;
+  }
+  return null;
+}
+// Lay a path as a left-to-right labelled chain in the EXACT node/edge shape the renderer expects (edges reference node
+// objects via from/to; relType:'DEFINED' so the hop labels render). steps = [{guid,title,label}], label = prev→this edge.
+function layoutPath(steps) {
+  const NW = 180, NH = 44, GX = 230, n = steps.length, x0 = -((n - 1) * GX) / 2;
+  const nodes = steps.map((s, i) => ({ guid: s.guid, title: s.title, x: x0 + i * GX, y: 0, w: i === 0 ? NW + 24 : NW, h: i === 0 ? NH + 8 : NH, focus: i === 0, role: i === n - 1 ? 'parent' : 'child', kind: 'ref', relType: 'INFERRED', dir: 'out' }));
+  const edges = [];
+  for (let i = 1; i < n; i++) edges.push({ from: nodes[i - 1], to: nodes[i], dir: 'out', kind: 'ref', role: 'child', relType: 'DEFINED', label: steps[i].label || '' });
+  return { nodes, edges };
+}
 // BP-3/P8: which of the 4 cross-layout bands a neighbour belongs to (top-level so the view can filter/hit-test gates).
 function crossBand(nb) { const r = nb.role; if (r === 'parent') return 'up'; if (r === 'child') return 'down'; if (r === 'sibling') return 'sib'; if (r === 'rightFriend' || r === 'next') return 'right'; if (r === 'leftFriend' || r === 'previous') return 'left'; if (nb.kind === 'url' || nb.kind === 'virtual') return 'right'; return 'left'; }
 const CROSS_BAND_CAP = 30; // BP-5: per-band node cap; overflow surfaces as a "+k" badge on the gate.
@@ -391,7 +412,7 @@ class BrainView {
     this.cssW = w; this.cssH = cvh;
   }
   async setFocus(guid, nav, force) {
-    this.focusGuid = guid;
+    this.focusGuid = guid; this._pathMode = false; // PATH-FINDER: any focus change exits path mode → back to the neighbourhood
     if (!nav) {
       this._history = this._history.slice(0, this._hi + 1);
       if (this._history[this._hi] !== guid) { this._history.push(guid); this._hi = this._history.length - 1; }
@@ -494,6 +515,58 @@ class BrainView {
   _saveHistory() { try { localStorage.setItem('plexus_brain_history', JSON.stringify({ h: this._history.slice(-50), i: this._hi })); } catch (_e) {} }
   _loadHistory() { try { const s = JSON.parse(localStorage.getItem('plexus_brain_history') || 'null'); if (s && Array.isArray(s.h)) { this._history = s.h.filter((g) => typeof g === 'string'); this._hi = Math.max(-1, Math.min(this._history.length - 1, s.i == null ? this._history.length - 1 : s.i)); } } catch (_e) {} }
   async _searchFocus(q) { q = (q || '').trim(); if (!q) return; try { const res = await this.plugin.data.searchByQuery(q, 5); const r = (res && res.records && res.records[0]); if (r && r.guid) { this.setFocus(r.guid); this._searchInp.value = ''; } else { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: no record matched "' + q + '".', dismissible: true }); } catch (_e) {} } } catch (_e) {} }
+  // PATH-FINDER: in-panel record search (no window.prompt on desktop) → resolves {guid,title} or null.
+  _promptSearch(label) {
+    return new Promise((resolve) => {
+      const ov = document.createElement('div'); ov.style.cssText = 'position:absolute;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45)';
+      const box = document.createElement('div'); box.style.cssText = 'background:#1b2030;border:1px solid #333a4a;border-radius:10px;padding:14px;min-width:320px;max-width:380px;box-shadow:0 10px 30px rgba(0,0,0,.45)';
+      const lab = document.createElement('div'); lab.textContent = label; lab.style.cssText = 'color:#e6e8ee;font:13px system-ui;margin-bottom:8px';
+      const inp = document.createElement('input'); inp.type = 'text'; inp.placeholder = 'Search a record…'; inp.style.cssText = 'width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #333a4a;border-radius:7px;background:#0f1117;color:#e6e8ee;font-size:14px;outline:none';
+      const results = document.createElement('div'); results.style.cssText = 'max-height:240px;overflow-y:auto;margin-top:8px';
+      let t = null; const done = (v) => { try { ov.remove(); } catch (_e) {} if (t) clearTimeout(t); resolve(v); };
+      ov.addEventListener('pointerdown', (e) => { if (e.target === ov) { e.stopPropagation(); done(null); } });
+      box.addEventListener('pointerdown', (e) => e.stopPropagation()); box.addEventListener('wheel', (e) => e.stopPropagation());
+      const search = async () => { const q = inp.value.trim(); if (!q) { results.innerHTML = ''; return; } let recs = []; try { const r = await this.plugin.data.searchByQuery(q, 8); recs = (r && r.records) || []; } catch (_e) {} results.innerHTML = ''; recs.slice(0, 8).forEach((rec) => { const nm = (rec.getName && rec.getName()) || 'Untitled'; const row = document.createElement('div'); row.textContent = nm; row.style.cssText = 'padding:6px 8px;border-radius:6px;cursor:pointer;color:#e6e8ee;font:13px system-ui;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'; row.addEventListener('mouseenter', () => { row.style.background = 'rgba(124,92,255,.22)'; }); row.addEventListener('mouseleave', () => { row.style.background = ''; }); row.addEventListener('mousedown', (e) => { e.preventDefault(); done({ guid: rec.guid, title: nm }); }); results.appendChild(row); }); };
+      inp.addEventListener('input', () => { if (t) clearTimeout(t); t = setTimeout(search, 200); });
+      inp.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Escape') done(null); });
+      box.appendChild(lab); box.appendChild(inp); box.appendChild(results); ov.appendChild(box); this.wrap.appendChild(ov); setTimeout(() => inp.focus(), 0);
+    });
+  }
+  // PATH-FINDER: BFS the typed-relation graph from the focus to a searched target; render the shortest labelled chain.
+  async _findPath() {
+    const start = (this._derived && this._derived.focus && this._derived.focus.guid) || this.focusGuid;
+    if (!start) { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: focus a note first.', dismissible: true }); } catch (_e) {} return; }
+    const tgt = await this._promptSearch('Shortest path from the focus to…');
+    if (!tgt || !tgt.guid) return;
+    if (tgt.guid === start) { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: pick a different target.', dismissible: true }); } catch (_e) {} return; }
+    try { this.plugin.ui.addToaster({ title: 'Plexus Brain: tracing the graph…', dismissible: true }); } catch (_e) {}
+    const prev = new Map([[start, null]]), elabel = new Map(), titles = new Map();
+    try { const r = await this.plugin.data.getRecord(start); titles.set(start, (r && r.getName && r.getName()) || 'Untitled'); } catch (_e) {}
+    let frontier = [start], hops = 0, found = false; const MAXHOPS = 6, MAXNODES = 700;
+    while (frontier.length && hops < MAXHOPS && !found && prev.size < MAXNODES) {
+      const next = [];
+      for (const g of frontier) {
+        if (found || prev.size >= MAXNODES) break;
+        let d = null; try { d = await cachedDerive(this.plugin, g); } catch (_e) {}
+        if (this.destroyed) return; if (!d) continue;
+        for (const nb of d.neighbours) {
+          if (!nb.guid || prev.has(nb.guid)) continue;
+          prev.set(nb.guid, g); elabel.set(g + '>' + nb.guid, nb.label || ROLE_LABEL[nb.role] || nb.role || 'related'); titles.set(nb.guid, nb.title || 'Untitled');
+          if (nb.guid === tgt.guid) { found = true; break; }
+          next.push(nb.guid);
+        }
+      }
+      frontier = next; hops++;
+    }
+    if (!prev.has(tgt.guid)) { try { this.plugin.ui.addToaster({ title: 'Plexus Brain: no path within ' + MAXHOPS + ' hops.', dismissible: true }); } catch (_e) {} return; }
+    const chain = []; let cur = tgt.guid; while (cur != null) { chain.unshift(cur); cur = prev.get(cur); }
+    const steps = chain.map((g, i) => ({ guid: g, title: titles.get(g) || 'Untitled', label: i > 0 ? (elabel.get(chain[i - 1] + '>' + g) || '') : '' }));
+    this._pathMode = true; this.graph = layoutPath(steps);
+    for (const nd of this.graph.nodes) { nd._fx = 0; nd._fy = 0; }
+    this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
+    this._fit(); this.dirty = true; if (this.emptyEl) this.emptyEl.style.display = 'none';
+    try { this.plugin.ui.addToaster({ title: 'Path: ' + steps.length + ' node(s), ' + (steps.length - 1) + ' hop(s) — click any node to refocus.', dismissible: true }); } catch (_e) {}
+  }
   _fit() {
     const nodes = this.graph.nodes; if (!nodes.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -646,7 +719,7 @@ class BrainView {
     // IO-4: focus open-tasks rail — real togglable task line items, stacked just below the focus node.
     this._taskRects = [];
     const ftasks = (this._derived && this._derived.focus && this._derived.focus.tasks) || [];
-    if (ftasks.length) {
+    if (ftasks.length && !this._pathMode) { // PATH-FINDER: hide the neighbourhood task rail in path mode (node[0] is far-left, not centered)
       ctx.font = '12px system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
       const RW = 250, RH = 24, x0 = -RW / 2, y0 = 48, show = Math.min(ftasks.length, 3);
       for (let i = 0; i < show; i++) {
@@ -699,6 +772,7 @@ class Plugin extends AppPlugin {
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Open graph', icon: 'ti-graph', onSelected: () => this._open(this._lastRecordGuid) });
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Focus current note', icon: 'ti-graph', onSelected: () => { const r = this._activeRecord(); this._open(r); } });
     this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Edit ontology (relation field names)', icon: 'ti-list-tree', onSelected: () => this._editOntology() }); // BP-7
+    this.ui.addCommandPaletteCommand({ label: 'Plexus Brain: Find shortest path to a record…', icon: 'ti-graph', onSelected: () => { const v = this._brainView(); if (v) v._findPath(); else { this._open(this._lastRecordGuid); try { this.ui.addToaster({ title: 'Plexus Brain: graph opened — re-run “Find shortest path”.', dismissible: true }); } catch (_e) {} } } }); // PATH-FINDER
     // BS-10: cross-plugin live companion — when you navigate to a record elsewhere, an OPEN Brain panel refocuses
     // to it (unless that view is pinned). Makes the Brain track Canvas/editor focus automatically.
     const track = (e) => { try { const r = e.panel && e.panel.getActiveRecord && e.panel.getActiveRecord(); if (r && r.guid) { this._lastRecordGuid = r.guid; for (const v of this._views) { if (!v._pinned && v.focusGuid && v.focusGuid !== r.guid) v._scheduleReFocus(r.guid, { nav: false }); } } } catch (_e) {} }; // debounced (rapid nav coalesces)
@@ -713,6 +787,7 @@ class Plugin extends AppPlugin {
   _teardown() { cancelAnimationFrame(this._raf); for (const v of this._views) { try { v.destroy(); } catch (_e) {} } this._views.clear(); window.__plexusBrain = undefined; }
   onUnload() { this._teardown(); }
   _activeRecord() { try { const p = this.ui.getActivePanel(); const r = p && p.getActiveRecord && p.getActiveRecord(); return (r && r.guid) || this._lastRecordGuid; } catch (_e) { return this._lastRecordGuid; } }
+  _brainView() { try { const ap = this.ui.getActivePanel && this.ui.getActivePanel(); for (const v of this._views) if (!v.destroyed && v.panel === ap) return v; } catch (_e) {} for (const v of this._views) if (!v.destroyed) return v; return null; } // PATH-FINDER: the active (else any) live Brain view
   // BP-2: build the field-resolution index once. Field schema (cheap) is awaited; the expensive recordGuid→collection
   // map builds in the BACKGROUND so the graph never blocks — DEFINED-relation enrichment lights up when it's ready.
   // BP-7: ontology editor — edit the shared relation field-name buckets; persists to localStorage['plexus_ontology']
