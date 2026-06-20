@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.28.0';
+const BRAIN_VERSION = '0.29.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -347,6 +347,21 @@ function layoutPath(steps) {
   for (let i = 1; i < n; i++) edges.push({ from: nodes[i - 1], to: nodes[i], dir: 'out', kind: 'ref', role: 'child', relType: 'DEFINED', label: steps[i].label || '' });
   return { nodes, edges };
 }
+// MULTI-HOP: concentric rings by hop (focus at centre, hop-1 inner ring, hop-2/3 outer). neighbours carry `.hop`;
+// edges (from/to GUIDS) resolve to node objects; nodes at hop≥2 get `dim:true` so render fades them. Pure + tested.
+function layoutRings(focus, neighbours, edges) {
+  const FW = 204, FH = 52, NW = 180, NH = 44;
+  const focusNode = { guid: focus.guid, title: focus.title, x: 0, y: 0, w: FW, h: FH, focus: true };
+  const nodes = [focusNode], byGuid = new Map([[focus.guid, focusNode]]);
+  const hops = {}; for (const nb of neighbours) (hops[nb.hop] = hops[nb.hop] || []).push(nb);
+  Object.keys(hops).map(Number).sort((a, b) => a - b).forEach((hop) => {
+    const ring = hops[hop], R = 160 + hop * 160, m = ring.length;
+    ring.forEach((nb, k) => { const ang = (k / Math.max(1, m)) * Math.PI * 2 - Math.PI / 2; const node = { guid: nb.guid, title: nb.title, x: Math.cos(ang) * R, y: Math.sin(ang) * R, w: NW, h: NH, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label, skin: nb.skin, collection: nb.collection, hop: hop, dim: hop >= 2 }; nodes.push(node); byGuid.set(nb.guid, node); });
+  });
+  const eds = [];
+  for (const e of edges) { const f = byGuid.get(e.from), t = byGuid.get(e.to); if (f && t) eds.push({ from: f, to: t, dir: e.dir, kind: e.kind, role: e.role, relType: e.relType, label: e.label, dim: !!(f.dim || t.dim) }); }
+  return { nodes, edges: eds };
+}
 // BP-3/P8: which of the 4 cross-layout bands a neighbour belongs to (top-level so the view can filter/hit-test gates).
 function crossBand(nb) { const r = nb.role; if (r === 'parent') return 'up'; if (r === 'child') return 'down'; if (r === 'sibling') return 'sib'; if (r === 'rightFriend' || r === 'next') return 'right'; if (r === 'leftFriend' || r === 'previous') return 'left'; if (nb.kind === 'url' || nb.kind === 'virtual') return 'right'; return 'left'; }
 const CROSS_BAND_CAP = 30; // BP-5: per-band node cap; overflow surfaces as a "+k" badge on the gate.
@@ -388,6 +403,7 @@ class BrainView {
     this._history = []; this._hi = -1; this._loadHistory(); // Phase 4 nav history; BP-6: restore persisted history
     this._filter = { in: true, ref: true, prop: true, tag: true, sem: false }; // Phase 5/6 kind filters (sem opt-in)
     this._layoutMode = 'radial'; // Phase 7: 'radial' | 'tree'
+    this._depth = 1; // MULTI-HOP: 1 | 2 | 3 — how many hops of neighbourhood to show
   }
   mount() {
     try { this.panel.setTitle('Brain'); } catch (_e) {}
@@ -432,7 +448,7 @@ class BrainView {
     if (prevSet) for (const n of this._derived.neighbours) n.isNew = !prevSet.has(n.guid);
     else for (const n of this._derived.neighbours) n.isNew = false; // clear stale diff flags on a cached / different-focus derive
     this._lastDerivedFocus = guid;
-    this._relayout();
+    if (this._depth > 1) this._expandHops(this._depth, token); else this._relayout(); // MULTI-HOP: expand to N hops, else 1-hop layout
   }
   // Trailing-edge debounce for EVENT-driven re-focus (record/lineitem changes, external navigation) so an edit storm
   // or rapid navigation coalesces into ONE derive. User clicks call setFocus directly (immediate).
@@ -448,6 +464,7 @@ class BrainView {
   // Phase 5: filter the derived neighbours by kind, re-layout with a FLIP tween (no re-derive).
   _relayout() {
     if (!this._derived) return;
+    this._multiHop = false; this._hopGen = (this._hopGen || 0) + 1; // MULTI-HOP: exit multi-hop + cancel any in-flight expansion
     const f = this._filter || { in: true, ref: true, prop: true, tag: true };
     const kept = this._derived.neighbours.filter((n) => f[n.dir === 'in' ? 'in' : (n.kind || 'ref')] !== false);
     const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
@@ -457,6 +474,41 @@ class BrainView {
     this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
     this._fit(); this.dirty = true; this._updateChrome();
     if (this.emptyEl) this.emptyEl.style.display = this.graph.nodes.length ? 'none' : 'flex';
+  }
+  // MULTI-HOP: BFS-expand the focus to `depth` hops (1-hop already in this._derived), lay out as concentric rings.
+  // `token` is the setFocus in-flight token — abort if a newer focus or depth change supersedes this expansion.
+  async _expandHops(depth, token) {
+    const focusD = this._derived; if (!focusD) return;
+    const gen = (this._hopGen = (this._hopGen || 0) + 1); // monotonic: a newer expansion (or _relayout) supersedes this one even at the same depth/focus
+    const start = focusD.focus.guid, neighbours = [], edges = [], seen = new Set([start]);
+    let frontier = [];
+    const f = this._filter || { in: true, ref: true, prop: true, tag: true };
+    for (const nb of focusD.neighbours) { if (!nb.guid || seen.has(nb.guid)) continue; if (f[nb.dir === 'in' ? 'in' : (nb.kind || 'ref')] === false) continue; seen.add(nb.guid); neighbours.push({ ...nb, hop: 1 }); edges.push({ from: start, to: nb.guid, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label }); frontier.push(nb.guid); }
+    for (let h = 2; h <= depth; h++) {
+      const next = [];
+      for (const g of frontier) {
+        if (neighbours.length > 220) break;
+        let d = null; try { d = await cachedDerive(this.plugin, g); } catch (_e) {}
+        if (this.destroyed || token !== this._focusToken || this._depth !== depth || gen !== this._hopGen) return; // superseded → abort silently
+        if (!d) continue;
+        for (const nb of d.neighbours) { if (!nb.guid || seen.has(nb.guid)) continue; seen.add(nb.guid); neighbours.push({ ...nb, hop: h }); edges.push({ from: g, to: nb.guid, dir: nb.dir, kind: nb.kind, role: nb.role, relType: nb.relType, label: nb.label }); next.push(nb.guid); }
+      }
+      frontier = next;
+    }
+    if (this.destroyed || token !== this._focusToken || this._depth !== depth || gen !== this._hopGen) return; // close the post-last-await window before writing this.graph
+    const prev = new Map((this.graph.nodes || []).map((n) => [n.guid, { x: n.x, y: n.y }]));
+    this._multiHop = true; this.graph = layoutRings(focusD.focus, neighbours, edges);
+    for (const n of this.graph.nodes) { const p = prev.get(n.guid); n._fx = p ? p.x : 0; n._fy = p ? p.y : 0; }
+    this._anim = { start: (window.performance && performance.now ? performance.now() : Date.now()), dur: 340 };
+    this._fit(); this.dirty = true; this._updateChrome && this._updateChrome();
+    if (this.emptyEl) this.emptyEl.style.display = this.graph.nodes.length ? 'none' : 'flex';
+  }
+  // MULTI-HOP: cycle depth 1→2→3 and re-render the focus at the new radius.
+  _cycleDepth() {
+    this._depth = (this._depth % 3) + 1;
+    if (this._depthBtn) { this._depthBtn.textContent = this._depth + 'h'; this._depthBtn.title = this._depth + '-hop radius (click to cycle)'; }
+    if (!this._derived) return;
+    if (this._depth > 1) this._expandHops(this._depth, this._focusToken); else this._relayout();
   }
   // Phase 6 semantic lens: embed the focus + a keyword-search candidate set, add the most-similar as 'sem'.
   async _addSemantic() {
@@ -489,6 +541,7 @@ class BrainView {
     const LAYOUTS = ['radial', 'cross', 'tree'], LGLYPH = { radial: '◎', cross: '✛', tree: '⊞' };
     this._layoutBtn = mkBtn('◎', () => { const i = (LAYOUTS.indexOf(this._layoutMode) + 1) % LAYOUTS.length; this._layoutMode = LAYOUTS[i]; this._layoutBtn.textContent = LGLYPH[this._layoutMode]; this._layoutBtn.title = this._layoutMode + ' layout (click to cycle)'; this._relayout(); }); // P8: radial → cross → tree
     this._layoutBtn.textContent = LGLYPH[this._layoutMode] || '◎'; this._layoutBtn.title = (this._layoutMode || 'radial') + ' layout (click to cycle)'; bar.appendChild(this._layoutBtn);
+    this._depthBtn = mkBtn((this._depth || 1) + 'h', () => this._cycleDepth()); this._depthBtn.title = (this._depth || 1) + '-hop radius (click to cycle)'; bar.appendChild(this._depthBtn); // MULTI-HOP
     this._crumbEl = document.createElement('span'); this._crumbEl.className = 'pb-crumb'; bar.appendChild(this._crumbEl);
     const sp = document.createElement('span'); sp.style.flex = '1'; bar.appendChild(sp);
     // Phase 5/6: relation-kind filter chips (colour-matched to relColor). 'sem' = the embedding lens (opt-in).
@@ -661,7 +714,7 @@ class BrainView {
     for (const ed of this.graph.edges) {
       const f = pos(ed.from), tn = pos(ed.to);
       const inf = ed.relType === 'INFERRED'; // BP-3/BP-4: inferred relations render dashed + dimmer than defined ones
-      ctx.strokeStyle = relColor(ed.role, ed.kind); ctx.globalAlpha = (inf ? 0.32 : 0.6) * e; ctx.lineWidth = 1.5 / z;
+      ctx.strokeStyle = relColor(ed.role, ed.kind); ctx.globalAlpha = (inf ? 0.32 : 0.6) * e * (ed.dim ? 0.45 : 1); ctx.lineWidth = 1.5 / z; // MULTI-HOP: fade outer-ring edges
       ctx.setLineDash(inf ? [5 / z, 4 / z] : []);
       ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.quadraticCurveTo((f.x + tn.x) / 2, (f.y + tn.y) / 2, tn.x, tn.y); ctx.stroke();
       ctx.setLineDash([]);
@@ -690,6 +743,7 @@ class BrainView {
       const w = nd.w * sc, h = nd.h * sc; const P = pos(nd); const x = P.x - w / 2, y = P.y - h / 2; const rad = 9;
       if (nd.isNew && !nd.focus) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x - 5, y - 5, w + 10, h + 10, rad + 4); else ctx.rect(x - 5, y - 5, w + 10, h + 10); ctx.lineWidth = 2.5 / z; ctx.strokeStyle = '#22c55e'; ctx.globalAlpha = 0.9; ctx.stroke(); ctx.globalAlpha = 1; } // BS-8: new-since-last-derive glow
       if (sk.urgent && !nd.focus) { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x - 4, y - 4, w + 8, h + 8, rad + 3); else ctx.rect(x - 4, y - 4, w + 8, h + 8); ctx.lineWidth = 2.5 / z; ctx.strokeStyle = '#ef4444'; ctx.globalAlpha = 0.85; ctx.stroke(); ctx.globalAlpha = 1; } // Due-past urgency ring
+      ctx.globalAlpha = nd.dim ? 0.5 : 1; // MULTI-HOP: fade outer-ring (hop≥2) nodes
       ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x, y, w, h, rad); else ctx.rect(x, y, w, h);
       ctx.fillStyle = nd.focus ? '#7c5cff' : '#1b2030'; ctx.fill();
       // BS-6: in 'collection' colour mode the border is the collection colour; else Status skin or role colour.
@@ -699,6 +753,7 @@ class BrainView {
       ctx.fillText(this._clip(ctx, nd.title, w - 18), P.x, P.y);
       // BS-6: collection dot (top-left corner) — a stable per-collection colour, the grouping cue.
       if (!nd.focus && nd.collection) { ctx.beginPath(); ctx.arc(x + 9, y + 9, 3.4, 0, Math.PI * 2); ctx.fillStyle = colorForString(nd.collection); ctx.fill(); }
+      ctx.globalAlpha = 1; // MULTI-HOP: reset after a possibly-dimmed node
     }
     // BP-4: directional gate headers (cross layout only) — label · count (+overflow), click to collapse/expand the band.
     this._gateRects = [];
