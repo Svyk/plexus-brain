@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.31.0';
+const BRAIN_VERSION = '0.32.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -872,7 +872,10 @@ class Plugin extends AppPlugin {
     try { window.__plexusBrain && window.__plexusBrain.dispose(); } catch (_e) {}
     this._views = new Set(); this._lastRecordGuid = null; this._raf = 0; this._disposers = [];
     this._ontology = loadPlexusOntology(); // IO-3: shared collection/relation ontology
-    window.__plexusBrain = { version: BRAIN_VERSION, dispose: () => this._teardown() };
+    // CITATION-GRAPH seam: let sibling Plexus plugins (Canvas, PDF Highlighter) open the graph focused on a record —
+    // e.g. a PDF Highlight or its Source Note → its citation neighbourhood (Source Note / Reply To thread / Section /
+    // co-cited highlights all render as edges). Returns the created panel (or null). Mirrors window.__plexusCanvas.dropSubgraph.
+    window.__plexusBrain = { version: BRAIN_VERSION, dispose: () => this._teardown(), focus: (guid) => { try { return guid ? this._open(guid) : null; } catch (_e) { return null; } } };
     console.log('%c[Plexus Brain] v' + BRAIN_VERSION + ' loaded', 'color:#7c3aed;font-weight:bold');
     this.ui.injectCSS(BASE_CSS);
     this.ui.registerCustomPanelType(PANEL_ID, (panel) => this._mount(panel));
