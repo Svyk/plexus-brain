@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.32.0';
+const BRAIN_VERSION = '0.32.1';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -892,11 +892,22 @@ class Plugin extends AppPlugin {
     // Re-derive on data change — DEBOUNCED + cache-invalidated, so an edit storm doesn't fire dozens of derives.
     const onChange = (e) => { const g = e && e.recordGuid; if (g) invalidateDerive(this, g); for (const v of this._views) { v._analytics = null; if (!g || v.focusGuid === g || v.graph.nodes.some((n) => n.guid === g)) { invalidateDerive(this, v.focusGuid); v._scheduleReFocus(v.focusGuid, { nav: true, force: true }); } } }; // GRAPH-ANALYTICS: any change invalidates the cached degree scan
     try { for (const ev of ['record.updated', 'lineitem.updated', 'lineitem.created', 'lineitem.deleted']) this.events.on(ev, onChange); } catch (_e) {}
-    const tick = () => { for (const v of this._views) { if (!v.host || !v.host.isConnected) { v.destroy(); this._views.delete(v); continue; } if (v.dirty) { try { v.render(); } catch (e) { console.error('[Plexus Brain] render', e); } v.dirty = false; } } this._raf = requestAnimationFrame(tick); };
-    this._raf = requestAnimationFrame(tick);
+    // A global plugin must not keep Thymer's compositor awake on ordinary note pages. The old
+    // unconditional RAF ran forever even when `_views` was empty, forcing a full presentation
+    // cadence across the whole app. Start the loop lazily from `_mount`; stop it as soon as the
+    // final Brain view disappears.
+    this._renderTick = () => {
+      this._raf = 0;
+      for (const v of this._views) {
+        if (!v.host || !v.host.isConnected) { v.destroy(); this._views.delete(v); continue; }
+        if (v.dirty) { try { v.render(); } catch (e) { console.error('[Plexus Brain] render', e); } v.dirty = false; }
+      }
+      if (this._views.size) this._raf = requestAnimationFrame(this._renderTick);
+    };
     if (TEST_HOOKS) this._installTestHooks();
   }
-  _teardown() { cancelAnimationFrame(this._raf); for (const v of this._views) { try { v.destroy(); } catch (_e) {} } this._views.clear(); window.__plexusBrain = undefined; }
+  _ensureRenderLoop() { if (!this._raf && this._views && this._views.size && this._renderTick) this._raf = requestAnimationFrame(this._renderTick); }
+  _teardown() { if (this._raf) cancelAnimationFrame(this._raf); this._raf = 0; this._renderTick = null; for (const v of this._views) { try { v.destroy(); } catch (_e) {} } this._views.clear(); window.__plexusBrain = undefined; }
   onUnload() { this._teardown(); }
   _activeRecord() { try { const p = this.ui.getActivePanel(); const r = p && p.getActiveRecord && p.getActiveRecord(); return (r && r.guid) || this._lastRecordGuid; } catch (_e) { return this._lastRecordGuid; } }
   _brainView() { try { const ap = this.ui.getActivePanel && this.ui.getActivePanel(); for (const v of this._views) if (!v.destroyed && v.panel === ap) return v; } catch (_e) {} for (const v of this._views) if (!v.destroyed) return v; return null; } // PATH-FINDER: the active (else any) live Brain view
@@ -953,7 +964,7 @@ class Plugin extends AppPlugin {
     if (!panel) return null;
     this._pendingFocus = focusGuid || null; panel.navigateToCustomType(PANEL_ID); return panel;
   }
-  _mount(panel) { const f = this._pendingFocus; this._pendingFocus = null; const v = new BrainView(this, panel, f); this._views.add(v); v.mount(); return v; }
+  _mount(panel) { const f = this._pendingFocus; this._pendingFocus = null; const v = new BrainView(this, panel, f); this._views.add(v); v.mount(); this._ensureRenderLoop(); return v; }
   _installTestHooks() {
     window.__plexusBrain.test = {
       views: () => [...this._views].map((v) => ({ focus: v.focusGuid, nodes: v.graph.nodes.length, edges: v.graph.edges.length })),
