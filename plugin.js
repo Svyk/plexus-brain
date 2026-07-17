@@ -6,7 +6,7 @@
  * Single-file plugin.js. Roadmap: ~/plexus/BRAIN-ROADMAP.md. Deploy: git push -> Plugins-Manager reinstall.
  */
 
-const BRAIN_VERSION = '0.32.1';
+const BRAIN_VERSION = '0.33.0';
 const PANEL_ID = 'plexus-brain';
 const TEST_HOOKS = true;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -516,25 +516,43 @@ class BrainView {
     if (!this._derived) return;
     if (this._depth > 1) this._expandHops(this._depth, this._focusToken); else this._relayout();
   }
-  // Phase 6 semantic lens: embed the focus + a keyword-search candidate set, add the most-similar as 'sem'.
+  // Semantic lens: Smart Connections owns embeddings/indexing. Brain asks the public service
+  // for record-level neighbours and falls back to a small native lexical search if it is absent.
   async _addSemantic() {
     if (!this._derived) return;
     if (this._derived._semDone) { this._relayout(); return; }
     this._derived._semDone = true;
     const focusTitle = this._derived.focus.title || '';
     const words = focusTitle.split(/\s+/).filter((w) => w.length > 3).slice(0, 5).join(' ') || focusTitle;
-    try { this.plugin.ui.addToaster({ title: 'Plexus Brain: embedding for the semantic lens… (first run loads a model)', dismissible: true }); } catch (_e) {}
-    let cands = [];
-    try { const res = await this.plugin.data.searchByQuery(words, 25); cands = ((res && res.records) || []).map((r) => ({ guid: r.guid, title: (r.getName && r.getName()) || '' })); } catch (_e) {}
     const seen = new Set([this._derived.focus.guid].concat(this._derived.neighbours.map((n) => n.guid)));
-    cands = cands.filter((c) => c.guid && c.title && !seen.has(c.guid)).slice(0, 18);
-    if (cands.length) {
+    try { this.plugin.ui.addToaster({ title: 'Plexus Brain: finding semantic neighbours…', dismissible: true }); } catch (_e) {}
+    let cands = [];
+    try {
+      const result = await this.plugin._semanticSimilarTo(this._derived.focus.guid, {
+        limit: 12,
+        excludedRecordGuids: [...seen],
+      });
+      cands = ((result && result.hits) || []).map((hit) => ({
+        guid: hit.recordGuid,
+        title: hit.name || hit.snippet || 'Untitled',
+        score: Number(hit.score != null ? hit.score : hit.cosine),
+        explanation: hit.explanation || null,
+      }));
+    } catch (_e) {
+      // Safe fallback keeps the lens useful without loading another model or blocking the UI.
       try {
-        const fv = await this.plugin._embed(focusTitle); const sims = [];
-        for (const c of cands) { try { const cv = await this.plugin._embed(c.title); let s = 0; for (let i = 0; i < fv.length; i++) s += fv[i] * cv[i]; sims.push({ guid: c.guid, title: c.title, sim: s }); } catch (_e) {} }
-        sims.sort((a, b) => b.sim - a.sim);
-        for (const c of sims.slice(0, 6)) if (c.sim > 0.4) this._derived.neighbours.push({ guid: c.guid, title: c.title, dir: 'out', kind: 'sem' });
-      } catch (_e) {}
+        const res = await this.plugin.data.searchByQuery(words, 12);
+        cands = ((res && res.records) || []).map((r, index) => ({
+          guid: r.guid,
+          title: (r.getName && r.getName()) || '',
+          score: Math.max(0, 0.35 - index * 0.02),
+          explanation: { source: 'native-lexical-fallback' },
+        }));
+      } catch (_ignored) {}
+    }
+    for (const c of cands.filter((c) => c.guid && c.title && !seen.has(c.guid) && (!Number.isFinite(c.score) || c.score >= 0.26)).slice(0, 6)) {
+      seen.add(c.guid);
+      this._derived.neighbours.push({ guid: c.guid, title: c.title, dir: 'out', kind: 'sem', score: c.score, explanation: c.explanation });
     }
     this._relayout();
   }
@@ -951,13 +969,17 @@ class Plugin extends AppPlugin {
     try { this._fieldIndex = await buildFieldIndex(this); } catch (_e) { this._fieldIndex = { byGuid: {}, byName: {} }; }
     buildRecordCollectionMap(this, this._fieldIndex).then((m) => { this._recColMap = m; }).catch(() => { this._recColMap = {}; });
   }
-  // Phase 6: local embedder (transformers.js, in-browser) — powers the semantic lens.
-  _getEmbedder() {
-    if (this._embedderP) return this._embedderP;
-    this._embedderP = (async () => { const t = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6'); try { t.env.allowLocalModels = false; } catch (_e) {} return await t.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2'); })();
-    return this._embedderP;
+  _semanticService() {
+    const api = typeof window !== 'undefined' ? window.__thymerSemanticV1 : null;
+    return api && api.contract === 'thymer-semantic-v1' && api.version === 1 ? api : null;
   }
-  async _embed(text) { const pipe = await this._getEmbedder(); const out = await pipe(String(text || '').slice(0, 400), { pooling: 'mean', normalize: true }); return Array.from(out.data); }
+  async _semanticSimilarTo(recordGuid, options) {
+    const api = this._semanticService();
+    if (!api || typeof api.similarTo !== 'function' || (typeof api.ready === 'function' && !api.ready())) {
+      throw new Error('shared semantic service unavailable');
+    }
+    return api.similarTo(recordGuid, Object.assign({ limit: 12, unitKinds: ['record'] }, options || {}));
+  }
   async _open(focusGuid) {
     const here = this.ui.getActivePanel();
     const panel = await this.ui.createPanel(here ? { afterPanel: here } : undefined);
@@ -988,12 +1010,12 @@ class Plugin extends AppPlugin {
         v._layoutMode = 'radial'; v._relayout(); await sleep(400); const radialY = v.graph.nodes[1].y;
         return { treeNeighbourY: Math.round(treeY), radialNeighbourY: Math.round(radialY), ok: treeY >= 90 && treeY !== radialY };
       },
-      // Phase 6 (view-independent): the local embedder loads + ranks similar text higher.
+      // Shared semantic-service contract; no Brain-owned model or vector index.
       embedTest: async () => {
         try {
-          const a = await this._embed('cat dog pet animal'), b = await this._embed('puppy kitten pets'), c = await this._embed('quarterly budget finance');
-          const cos = (x, y) => { let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; };
-          return { dim: a.length, modelLoaded: !!this._embedderP, petSim: +cos(a, b).toFixed(3), petFinSim: +cos(a, c).toFixed(3), ok: cos(a, b) > cos(a, c) };
+          const api = this._semanticService();
+          const snapshot = api && api.snapshot ? api.snapshot() : null;
+          return { contract: api && api.contract, ready: !!(api && api.ready && api.ready()), snapshot, ok: !!api };
         } catch (e) { return { error: String(e) }; }
       },
       // Phase 6 semantic lens: focus a record, enable the lens, confirm 'sem' neighbours get added.
